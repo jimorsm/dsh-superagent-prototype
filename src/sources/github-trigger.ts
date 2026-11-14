@@ -2,6 +2,14 @@
 import { z } from 'zod'
 import { key, type ChannelRef, type Trigger } from '../core/index.ts'
 import { escapeRegExp, sameName } from '../infra/text.ts'
+import type { Deployment } from '../deployment.ts'
+
+/** The deployment's GitHub account. GitHub loops and channels only run when a GitHub forge is configured, so an absent one is a defect. */
+export const githubOf = (deployment: Pick<Deployment, 'github'>): NonNullable<Deployment['github']> => {
+  const github = deployment.github
+  if (!github) throw new Error('The GitHub Source is not configured')
+  return github
+}
 
 export const SOURCE = 'github'
 /** GitHub reply address: issue/PR conversation, or a review thread when `url` points at a discussion comment. */

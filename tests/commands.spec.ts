@@ -12,7 +12,7 @@ import { testDeployment } from './fixtures/deployment.ts'
 const sources = new SourceRegistry(() => SettingsSchema.parse({}))
 sources.register(feishuKind); sources.register(githubKind)
 const send = (commands: Commands, message: OutboundMessage) => sources.send(message, commands)
-const deployment = testDeployment({ github: { ...testDeployment().github, cli: '/path/agent-gh' } })
+const deployment = testDeployment({ github: { ...testDeployment().github!, cli: '/path/agent-gh' } })
 const REPOSITORY = deployment.repository
 const reply = { id: 'stable-operation', channel: githubChannel(8), text: 'Done', kind: 'reply' as const }
 describe('account-isolated operations', () => {
@@ -212,4 +212,20 @@ it('stops a running command when the signal of its work aborts, or the lifetime,
   lifetime.abort()
   await expect(other).rejects.toThrow()
   expect(Date.now() - started).toBeLessThan(4000)
+})
+
+describe('gitlab operations', () => {
+  const gitlabDeployment = testDeployment({ gitlab: { cli: '/path/agent-glab', host: 'https://gitlab.example.com', project: 'devops/sandbox', login: 'agent-bot', noreply: 'n' } })
+  it('calls the GitLab API restricted to the configured project', async () => {
+    const commands = new Commands(() => gitlabDeployment, {}, new AbortController().signal)
+    const glab = vi.spyOn(commands, 'glab').mockResolvedValue({})
+    await commands.glabApi(z.unknown(), 'issues/8/notes', '--method', 'POST', '-f', 'body=hi')
+    expect(glab).toHaveBeenCalledWith(['api', 'projects/devops%2Fsandbox/issues/8/notes', '--method', 'POST', '-f', 'body=hi'])
+    await expect(commands.glabApi('../version')).rejects.toThrow('restricted to the configured project')
+    await expect(commands.glabApi('/absolute')).rejects.toThrow('restricted to the configured project')
+  })
+  it('refuses GitLab commands when the deployment has no GitLab forge', async () => {
+    const commands = new Commands(() => testDeployment({ gitlab: undefined }), {}, new AbortController().signal)
+    await expect(commands.glab(['api', 'user'])).rejects.toThrow('The GitLab Source is not configured')
+  })
 })

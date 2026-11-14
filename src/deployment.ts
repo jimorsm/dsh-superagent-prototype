@@ -39,7 +39,8 @@ export function machineOf(config: DeploymentConfig): Machine {
   const unknown = Object.keys(config).filter(key => !(key in (Config.dict ?? {})))
   if (unknown.length) throw new Error(`dsh-superagent configuration has keys it does not use: ${unknown.map(key => MOVED[key] ? `${key} (now ${MOVED[key]})` : key).join(', ')}; docs/006-deployment.md lists the keys`)
   const { stateDir, promptMaxChars, admissionContextMaxPages, admissionContextTimeoutMs } = config
-  return { stateDir, promptMaxChars, admissionContextMaxPages, admissionContextTimeoutMs }
+  // schemastery resolves .volatile() fields as plain numbers here; they are Volatile references at runtime.
+  return { stateDir, promptMaxChars, admissionContextMaxPages, admissionContextTimeoutMs } as unknown as Machine
 }
 
 export const GithubAccountsSchema = z.object({
@@ -47,12 +48,21 @@ export const GithubAccountsSchema = z.object({
   cli: z.string().trim().default(''),
 })
 export const FeishuBotSchema = z.object({ cli: z.string().trim().default('') })
+/** GitLab forge account: instance URL, the project it works on (group/subgroup/path), and the agent's glab CLI. All empty means not configured. */
+export const GitlabAccountSchema = z.object({
+  host: z.string().trim().regex(/^$|^https?:\/\/[^/]+$/, 'https://gitlab.example.com').default(''),
+  project: z.string().trim().regex(/^$|^[A-Za-z0-9_.-]+(\/[A-Za-z0-9_.-]+)+$/, 'group/name').default(''),
+  cli: z.string().trim().default(''),
+})
 /** Source configuration keys that affect deployment setup and trigger a restart when changed. */
-export const SETUP_FIELDS: Readonly<Record<string, readonly string[]>> = { github: Object.keys(GithubAccountsSchema.shape), feishu: Object.keys(FeishuBotSchema.shape) }
+export const SETUP_FIELDS: Readonly<Record<string, readonly string[]>> = { github: Object.keys(GithubAccountsSchema.shape), feishu: Object.keys(FeishuBotSchema.shape), gitlab: Object.keys(GitlabAccountSchema.shape) }
 
+export interface GitlabAccount { cli: string; host: string; project: string; login: string; noreply: string }
 export interface Deployment extends Machine {
+  /** Canonical GitHub repository (owner/name); '' when no GitHub forge is configured. */
   repository: string
-  github: { cli: string; login: string; noreply: string }
+  github?: { cli: string; login: string; noreply: string }
+  gitlab?: GitlabAccount
   feishu?: FeishuBot
 }
 export interface FeishuBot { cli: string; appId: string; brand: 'feishu' | 'lark'; botId: string; name: string }
@@ -103,6 +113,54 @@ export async function resolveDeployment(machine: Machine, github: unknown, probe
   const repository = access.name
   if (access.push !== true) throw new SetupError('repositoryReadOnly', { account: agent.login, repository })
   return { ...machine, repository, github: { cli, login: agent.login, noreply: `${agent.id}+${agent.login}@users.noreply.github.com` } }
+}
+
+/** Resolve every configured forge (GitHub and/or GitLab); at least one must resolve, so the agent always has a forge to act on. */
+export async function resolveForges(machine: Machine, forges: { github?: unknown; gitlab?: unknown }, probe: Probe, path = process.env.PATH ?? ''): Promise<Deployment> {
+  const githubCfg = GithubAccountsSchema.parse(forges.github ?? {})
+  const gitlabCfg = GitlabAccountSchema.parse(forges.gitlab ?? {})
+  // A Source the operator touched keeps its own precise setup errors (repositoryUnset and friends); only a completely
+  // unconfigured pair of Sources resolves to forgeUnset.
+  const githubTouched = !!(githubCfg.repository || githubCfg.cli)
+  const gitlabTouched = !!(gitlabCfg.host || gitlabCfg.project || gitlabCfg.cli)
+  const githubPart = githubTouched ? await resolveDeployment(machine, githubCfg, probe, path) : undefined
+  const gitlab = gitlabTouched ? await resolveGitlab(machine, gitlabCfg, probe, path) : undefined
+  if (!githubPart && !gitlab) throw new SetupError('forgeUnset')
+  return githubPart ? { ...githubPart, ...(gitlab ? { gitlab } : {}) } : { ...machine, repository: '', gitlab: gitlab! }
+}
+
+const GitlabUser = z.object({ username: z.string().min(1), id: z.number().int().positive() })
+const GitlabProject = z.looseObject({
+  path_with_namespace: z.string().min(1),
+  permissions: z.looseObject({
+    project_access: z.looseObject({ access_level: z.number().int() }).nullish(),
+    group_access: z.looseObject({ access_level: z.number().int() }).nullish(),
+  }).nullish(),
+})
+/**
+ * Verify the agent's GitLab CLI identity and its access to the configured project (Developer, level 30, or above pushes).
+ * Returns undefined when the GitLab Source names nothing at all; partial configuration is a setup error, as on GitHub.
+ */
+export async function resolveGitlab(machine: Machine, gitlab: unknown, probe: Probe, path = process.env.PATH ?? ''): Promise<GitlabAccount | undefined> {
+  const accounts = GitlabAccountSchema.parse(gitlab ?? {})
+  if (!accounts.host && !accounts.project && !accounts.cli) return undefined
+  if (!accounts.host) throw new SetupError('gitlabHostUnset')
+  if (!accounts.project) throw new SetupError('gitlabProjectUnset')
+  if (!accounts.cli) throw new SetupError('gitlabCliUnset')
+  let cli: string
+  try { cli = executable(accounts.cli, path, workerBin(machine.stateDir)) } catch (error) { throw new SetupError('gitlabCliMissing', { output: reason(error) }) }
+  const text = await probe([cli, 'api', 'user']).catch((error: unknown) => { throw new SetupError('gitlabCliSignedOut', { output: reason(error) }) })
+  const agent = parsed(GitlabUser, text)
+  if (!agent) throw new SetupError('gitlabCliNoAccount')
+  // Use the canonical path returned by GitLab so renamed projects match incoming events.
+  const access = parsed(GitlabProject, await probe([cli, 'api', `projects/${encodeURIComponent(accounts.project)}`]).catch((error: unknown) => {
+    throw new SetupError('gitlabProjectUnreadable', { account: agent.username, project: accounts.project, output: reason(error) })
+  }))
+  if (!access) throw new SetupError('gitlabProjectUnreported', { project: accounts.project })
+  const level = access.permissions?.project_access?.access_level ?? access.permissions?.group_access?.access_level ?? 0
+  if (level < 30) throw new SetupError('gitlabProjectReadOnly', { account: agent.username, project: access.path_with_namespace })
+  const host = accounts.host.replace(/\/+$/, '')
+  return { cli, host, project: access.path_with_namespace, login: agent.username, noreply: `${agent.id}_${agent.username}@users.noreply.${host.replace(/^https?:\/\//, '')}` }
 }
 
 const AuthStatus = z.object({ appId: z.string().regex(/^cli_[A-Za-z0-9]+$/), brand: z.enum(['feishu', 'lark']).default('feishu'), identities: z.object({ bot: z.object({ status: z.string() }) }) })

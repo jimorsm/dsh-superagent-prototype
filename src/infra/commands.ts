@@ -72,8 +72,39 @@ export class Commands {
       return stdout
     } catch (error) { throw commandError(error, program) }
   }
+  /** The deployment's GitHub CLI; GitHub operations are unavailable without a configured GitHub forge. */
+  private get githubCli(): string {
+    const github = this.deployment.github
+    if (!github) throw new Error('The GitHub Source is not configured')
+    return github.cli
+  }
   /** Runs the agent's GitHub CLI and parses its JSON output; callers should prefer `api`, which is restricted to the configured repository and validates output. */
-  async gh<T>(args: string[]): Promise<T> { return JSON.parse(await this.run(this.deployment.github.cli, args)) as T }
+  async gh<T>(args: string[]): Promise<T> { return JSON.parse(await this.run(this.githubCli, args)) as T }
+  /** The deployment's GitLab CLI; GitLab operations are unavailable without a configured GitLab forge. */
+  private get gitlabCli(): string {
+    const gitlab = this.deployment.gitlab
+    if (!gitlab) throw new Error('The GitLab Source is not configured')
+    return gitlab.cli
+  }
+  /** Runs the agent's GitLab CLI and parses its JSON output; callers should prefer `glabApi`, which is restricted to the configured project and validates output. */
+  async glab<T>(args: string[]): Promise<T> { return JSON.parse(await this.run(this.gitlabCli, args)) as T }
+  /**
+   * Calls the GitLab API on a path within the configured project, validating JSON output when a schema is provided
+   * or returning raw CLI output when omitted.
+   * @throws CliError with GitLab's HTTP status as `code` on failure.
+   */
+  async glabApi<T>(schema: z.ZodType<T>, path: string, ...flags: string[]): Promise<T>
+  async glabApi(path: string, ...flags: string[]): Promise<string>
+  async glabApi<T>(schema: z.ZodType<T> | string, ...rest: string[]): Promise<T | string> {
+    if (typeof schema === 'string') return this.run(this.gitlabCli, ['api', this.glabPath(schema), ...rest])
+    const [path = '', ...flags] = rest
+    return schema.parse(await this.glab(['api', this.glabPath(path), ...flags]))
+  }
+  /** Fetches all pages of a GitLab API list within the configured project, skipping items that fail schema validation. */
+  async glabPages<T>(item: z.ZodType<T>, path: string, tally?: Tally): Promise<T[]> {
+    const pages = z.array(z.array(z.unknown())).parse(await this.glab(['api', this.glabPath(path), '--paginate', '--slurp']))
+    return validItems(item, pages.flat(), tally)
+  }
   /**
    * Calls the GitHub API on a path within the configured repository, validating JSON output when a schema is provided
    * or returning raw CLI output (such as raw files or `--include` headers) when omitted.
@@ -82,7 +113,7 @@ export class Commands {
   async api<T>(schema: z.ZodType<T>, path: string, ...flags: string[]): Promise<T>
   async api(path: string, ...flags: string[]): Promise<string>
   async api<T>(schema: z.ZodType<T> | string, ...rest: string[]): Promise<T | string> {
-    if (typeof schema === 'string') return this.run(this.deployment.github.cli, ['api', this.path(schema), ...rest])
+    if (typeof schema === 'string') return this.run(this.githubCli, ['api', this.path(schema), ...rest])
     const [path = '', ...flags] = rest
     return schema.parse(await this.gh(['api', this.path(path), ...flags]))
   }
@@ -93,8 +124,15 @@ export class Commands {
   }
   private path(path: string): string {
     const outside = /^\/|^[a-z]+:|(^|\/)\.\.?(\/|\?|$)/i.test(path)
-    if (outside) throw new Error('GitHub calls are restricted to the configured repository')
+    if (outside || !this.repository) throw new Error('GitHub calls are restricted to the configured repository')
     return path ? `repos/${this.repository}/${path}` : `repos/${this.repository}`
+  }
+  private glabPath(path: string): string {
+    const outside = /^\/|^[a-z]+:|(^|\/)\.\.?(\/|\?|$)/i.test(path)
+    if (outside) throw new Error('GitLab calls are restricted to the configured project')
+    const project = encodeURIComponent(this.deployment.gitlab?.project ?? '')
+    if (!project) throw new Error('The GitLab Source is not configured')
+    return path ? `projects/${project}/${path}` : `projects/${project}`
   }
   /**
    * Runs the Feishu bot's `lark-cli` and returns the JSON `data` payload.

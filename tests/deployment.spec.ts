@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { promisify } from 'node:util'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { Config, executable, machineOf, resolveDeployment, resolveFeishuBot, type Machine, type Probe } from '../src/deployment.ts'
+import { Config, executable, GitlabAccountSchema, machineOf, resolveDeployment, resolveFeishuBot, resolveForges, resolveGitlab, type Machine, type Probe } from '../src/deployment.ts'
 import { gitEnv } from './fixtures/git.ts'
 
 const exec = promisify(execFile)
@@ -13,6 +13,8 @@ let path: string
 const program = (file: string, body = ''): string => { writeFileSync(file, `#!/bin/sh\n${body}\n`); chmodSync(file, 0o755); return file }
 /** Fake gh CLI signed in as `login` with configurable push access to acme/widgets (including its former name acme/gadgets). */
 const gh = (file: string, login: string, push = true): string => program(file, `case "$*" in\n  "api user") echo '{"login":"${login}","id":7}' ;;\n  "api repos/acme/"*" --jq {name: .full_name, push: .permissions.push}") echo '{"name":"acme/widgets","push":${push}}' ;;\n  *) exit 1 ;;\nesac`)
+/** Fake glab CLI signed in as `login` with the given access level on devops/sandbox. */
+const glab = (file: string, login: string, level: number | 'group-null' = 40): string => program(file, `case "\$*" in\n  "api user") echo '{"username":"${login}","id":7}' ;;\n  "api projects/devops%2Fsandbox") echo '{"path_with_namespace":"devops/sandbox","permissions":{"project_access":null,"group_access":{"access_level":${level === 'group-null' ? 0 : level},"notification_level":3}}}' ;;\n  *) exit 1 ;;\nesac`)
 /** Fake lark-cli script body returning canned auth, strict-mode, and bot info responses. */
 const lark = (status: object, mode = 'bot', bot: object = { bot: { open_id: 'ou_bot', app_name: 'Widgets Bot' }, code: 0 }): string =>
   `case "$*" in\n  "auth status") echo '${JSON.stringify(status)}' ;;\n  "config strict-mode") echo 'strict-mode: ${mode} (source: profile)' ;;\n  "api GET /open-apis/bot/v3/info --as bot --format ndjson") echo '${JSON.stringify(bot)}' ;;\nesac`
@@ -27,6 +29,7 @@ beforeEach(async () => {
   mkdirSync(join(dir, 'bin')); mkdirSync(join(dir, 'state', 'worker-bin'), { recursive: true }); mkdirSync(join(dir, 'widgets', 'src'), { recursive: true })
   path = [join(dir, 'state-link', 'worker-bin'), `${join(dir, 'state', 'worker-bin')}/`, join(dir, 'bin'), '/usr/bin', '/bin'].join(':')
   gh(join(dir, 'bin', 'gh'), 'Agent-Bot')
+  glab(join(dir, 'bin', 'glab'), 'agent-bot')
   program(join(dir, 'bin', 'lark-cli'), lark({ appId: 'cli_bot', brand: 'lark', identities: { bot: { status: 'ready' } } }))
   // Stale worker shims with the same binary name must be skipped regardless of PATH normalization or symlinks.
   program(join(dir, 'state', 'worker-bin', 'gh'))
@@ -97,5 +100,44 @@ describe('setup', () => {
     await refuses('feishuNoBot')
     program(join(dir, 'bin', 'lark-cli'), 'echo "not configured" >&2; exit 1')
     await refuses('feishuCliFailed', { output: expect.stringContaining('not configured') })
+  })
+})
+
+describe('gitlab forge', () => {
+  it('reads the project from the GitLab Source and the account from its CLI, skipping worker shims', async () => {
+    const account = await resolveGitlab(machine(), { host: 'https://gitlab.example.com', project: 'devops/sandbox', cli: 'glab' }, probe, path)
+    expect(account).toEqual({ cli: join(dir, 'bin', 'glab'), host: 'https://gitlab.example.com', project: 'devops/sandbox',
+      login: 'agent-bot', noreply: '7_agent-bot@users.noreply.gitlab.example.com' })
+    // 全空 = 未配置，返回 undefined 而不是报错
+    expect(await resolveGitlab(machine(), {}, probe, path)).toBeUndefined()
+    expect(await resolveGitlab(machine(), undefined, probe, path)).toBeUndefined()
+  })
+  it('names what gitlab setup needs and where it is set', async () => {
+    const needs = (code: string, values: Record<string, unknown>, gitlab: unknown) =>
+      expect(resolveGitlab(machine(), gitlab, probe, path)).rejects.toEqual(setupError('gitlab', code, values))
+    await needs('gitlabHostUnset', {}, { project: 'devops/sandbox', cli: 'glab' })
+    // 主机地址格式由 schema 在保存时拦截（ZodError），不到 setup
+    expect(() => GitlabAccountSchema.parse({ host: 'gitlab.example.com' })).toThrow()
+    await needs('gitlabProjectUnset', {}, { host: 'https://gitlab.example.com', cli: 'glab' })
+    await needs('gitlabCliUnset', {}, { host: 'https://gitlab.example.com', project: 'devops/sandbox' })
+    await needs('gitlabCliMissing', { output: `${join(dir, 'missing')} is not an executable file` },
+      { host: 'https://gitlab.example.com', project: 'devops/sandbox', cli: join(dir, 'missing') })
+    await needs('gitlabCliSignedOut', {}, { host: 'https://gitlab.example.com', project: 'devops/sandbox', cli: program(join(dir, 'bin', 'glab-broken'), 'exit 1') })
+    await needs('gitlabCliNoAccount', {}, { host: 'https://gitlab.example.com', project: 'devops/sandbox', cli: program(join(dir, 'bin', 'glab-anon'), `echo '{}'`) })
+    const unreadable = program(join(dir, 'bin', 'glab-outsider'),
+      `case "\$*" in\n  "api user") echo '{"username":"agent-bot","id":7}' ;;\n  *) echo 'HTTP 404' >&2; exit 1 ;;\nesac`)
+    await needs('gitlabProjectUnreadable', { account: 'agent-bot', project: 'devops/sandbox' },
+      { host: 'https://gitlab.example.com', project: 'devops/sandbox', cli: unreadable })
+    glab(join(dir, 'bin', 'glab-reader'), 'agent-bot', 10)
+    await needs('gitlabProjectReadOnly', { account: 'agent-bot', project: 'devops/sandbox' },
+      { host: 'https://gitlab.example.com', project: 'devops/sandbox', cli: 'glab-reader' })
+  })
+  it('composes forges: gitlab alone is enough, and none is a setup error', async () => {
+    const gitlabOnly = await resolveForges(machine(), { gitlab: { host: 'https://gitlab.example.com', project: 'devops/sandbox', cli: 'glab' } }, probe, path)
+    expect(gitlabOnly).toMatchObject({ repository: '', gitlab: { login: 'agent-bot' } })
+    expect(gitlabOnly).not.toHaveProperty('github')
+    const both = await resolveForges(machine(), { github: { repository: 'acme/widgets', cli: 'gh' }, gitlab: { host: 'https://gitlab.example.com', project: 'devops/sandbox', cli: 'glab' } }, probe, path)
+    expect(both).toMatchObject({ repository: 'acme/widgets', github: { login: 'Agent-Bot' }, gitlab: { login: 'agent-bot' } })
+    await expect(resolveForges(machine(), {}, probe, path)).rejects.toEqual(setupError('deployment', 'forgeUnset', {}))
   })
 })
