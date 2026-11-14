@@ -17,7 +17,8 @@
     "./github-watch": "./lib/github-watch.js",
     "./feishu-watch": "./lib/feishu-watch.js",
     "./package.json": "./package.json",
-    "./locale/*.json": "./locale/*.json"
+    "./locale/*.json": "./locale/*.json",
+    "./gitlab-watch": "./lib/gitlab-watch.js"
   },
   "files": [
     "lib",
