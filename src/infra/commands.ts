@@ -89,8 +89,8 @@ export class Commands {
   /** Runs the agent's GitLab CLI and parses its JSON output; callers should prefer `glabApi`, which is restricted to the configured project and validates output. */
   async glab<T>(args: string[]): Promise<T> { return JSON.parse(await this.run(this.gitlabCli, args)) as T }
   /**
-   * Calls the GitLab API on a path within the configured project, validating JSON output when a schema is provided
-   * or returning raw CLI output when omitted.
+   * Calls the GitLab API on a path within one configured project (the first when `project` is omitted), validating JSON
+   * output when a schema is provided or returning raw CLI output when omitted.
    * @throws CliError with GitLab's HTTP status as `code` on failure.
    */
   async glabApi<T>(schema: z.ZodType<T>, path: string, ...flags: string[]): Promise<T>
@@ -100,9 +100,18 @@ export class Commands {
     const [path = '', ...flags] = rest
     return schema.parse(await this.glab(['api', this.glabPath(path), ...flags]))
   }
+  /** Calls the GitLab API on a path within the named configured project. */
+  async glabApiOn<T>(project: string, schema: z.ZodType<T>, path: string, ...flags: string[]): Promise<T> {
+    return schema.parse(await this.glab(['api', this.glabPath(path, project), ...flags]))
+  }
   /** Fetches all pages of a GitLab API list within the configured project, skipping items that fail schema validation. */
   async glabPages<T>(item: z.ZodType<T>, path: string, tally?: Tally): Promise<T[]> {
     const pages = z.array(z.array(z.unknown())).parse(await this.glab(['api', this.glabPath(path), '--paginate', '--slurp']))
+    return validItems(item, pages.flat(), tally)
+  }
+  /** `glabPages` within the named configured project. */
+  async glabPagesOn<T>(project: string, item: z.ZodType<T>, path: string, tally?: Tally): Promise<T[]> {
+    const pages = z.array(z.array(z.unknown())).parse(await this.glab(['api', this.glabPath(path, project), '--paginate', '--slurp']))
     return validItems(item, pages.flat(), tally)
   }
   /**
@@ -127,12 +136,17 @@ export class Commands {
     if (outside || !this.repository) throw new Error('GitHub calls are restricted to the configured repository')
     return path ? `repos/${this.repository}/${path}` : `repos/${this.repository}`
   }
-  private glabPath(path: string): string {
+  private glabPath(path: string, project?: string): string {
     const outside = /^\/|^[a-z]+:|(^|\/)\.\.?(\/|\?|$)/i.test(path)
-    if (outside) throw new Error('GitLab calls are restricted to the configured project')
-    const project = encodeURIComponent(this.deployment.gitlab?.project ?? '')
-    if (!project) throw new Error('The GitLab Source is not configured')
-    return path ? `projects/${project}/${path}` : `projects/${project}`
+    if (outside) throw new Error('GitLab calls are restricted to the configured projects')
+    const projects = this.deployment.gitlab?.projects ?? []
+    if (!projects.length) throw new Error('The GitLab Source is not configured')
+    const target = project ?? projects[0]!
+    if (!projects.some(configured => configured.toLowerCase() === target.toLowerCase())) {
+      throw new Error(`GitLab calls are restricted to the configured projects: ${projects.join(', ')}`)
+    }
+    const encoded = encodeURIComponent(target)
+    return path ? `projects/${encoded}/${path}` : `projects/${encoded}`
   }
   /**
    * Runs the Feishu bot's `lark-cli` and returns the JSON `data` payload.

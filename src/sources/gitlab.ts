@@ -1,4 +1,4 @@
-/** GitLab source kind: todo and note polling, webhook doorbell, and the Cordis plugin entry. */
+/** GitLab source kind: multi-project todo and note polling, webhook doorbell, and the Cordis plugin entry. */
 import type { Context } from '@deepseek-ai/cordis'
 import { createHash, timingSafeEqual } from 'node:crypto'
 import type { IncomingMessage, ServerResponse } from 'node:http'
@@ -8,7 +8,7 @@ import { KV } from '../kv.ts'
 import { health, sourceContext, type SourceContext } from './host.ts'
 import { cursorAt, pause, pollThreads as pollEach } from './poll.ts'
 import type { Localized, SourceKind } from './kind.ts'
-import { NoteSchema, openedTrigger, noteTrigger, todoTrigger, TodoSchema, refId, SOURCE, type GitlabRef } from './gitlab-trigger.ts'
+import { NoteSchema, openedTrigger, noteTrigger, todoTrigger, TodoSchema, parseRefId, refId, SOURCE } from './gitlab-trigger.ts'
 import { gitlabLink, sendGitlab } from './gitlab-channel.ts'
 import { gitlabThreadContext } from './gitlab-read.ts'
 import { sameName } from '../infra/text.ts'
@@ -22,6 +22,8 @@ export const GitlabConfigSchema = GitlabAccountSchema.extend({
   observeNotes: z.boolean().default(false),
 }).strict()
 export type GitlabConfig = z.infer<typeof GitlabConfigSchema>
+/** The configured project paths, deduplicated. */
+const projectsOf = (config: GitlabConfig): string[] => [...new Set(config.projects.map(entry => entry.project))]
 
 const ProjectSchema = z.looseObject({ id: z.number().int(), path_with_namespace: z.string() })
 const IssueOpenedSchema = z.looseObject({
@@ -64,26 +66,31 @@ function newDoorbell(): Doorbell {
 export const gitlabKind: SourceKind<GitlabConfig> = {
   kind: SOURCE,
   title: { zh: 'GitLab', en: 'GitLab' },
-  description: { zh: '智能体的 GitLab 账号；接收项目里发给它的提及与待办、已订阅 issue 与 MR 的讨论。', en: 'The agent\u2019s GitLab account; receives mentions and todos addressed to it in the project, and discussion on subscribed issues and merge requests.' },
+  description: { zh: '智能体的 GitLab 账号；接收这些项目里发给它的提及与待办、已订阅 issue 与 MR 的讨论。', en: 'The agent\u2019s GitLab account; receives mentions and todos addressed to it in these projects, and discussion on subscribed issues and merge requests.' },
   schema: GitlabConfigSchema,
   fields: [
     { key: 'host', type: 'text', pattern: '^https?://[^/]+$', label: { zh: '实例地址', en: 'Instance URL' },
       hint: { zh: '例如 https://gitlab.example.com，不带结尾斜线。', en: 'For example https://gitlab.example.com, without a trailing slash.' } },
-    { key: 'project', type: 'text', pattern: '^[A-Za-z0-9_.-]+(/[A-Za-z0-9_.-]+)+$', label: { zh: '监听的项目', en: 'Project' },
-      hint: { zh: '写作 group/name 或 group/sub/name。保存时检查智能体账号能否推送（Developer 及以上），然后重启 dsh-superagent。', en: 'Written group/name or group/sub/name. Saving checks the agent account can push (Developer or above), then restarts dsh-superagent.' } },
+    { key: 'projects', type: 'rows', label: { zh: '监听的项目', en: 'Projects' }, columns: [
+      { key: 'project', type: 'text', label: { zh: '项目', en: 'Project' }, pattern: '[A-Za-z0-9_.-]+(/[A-Za-z0-9_.-]+)+' },
+    ], hint: { zh: '写作 group/name 或 group/sub/name，可以多个。保存时逐个检查智能体账号能否推送（Developer 及以上），然后重启 dsh-superagent。', en: 'Written group/name or group/sub/name; several are allowed. Saving checks the agent account can push to each (Developer or above), then restarts dsh-superagent.' } },
     { key: 'cli', type: 'text', label: { zh: '智能体的 GitLab CLI', en: 'Agent GitLab CLI' },
       hint: { zh: '命令名或绝对路径，通常是用 GLAB_CONFIG_DIR 登录智能体账号的 glab 包装脚本。', en: 'A command name or absolute path, usually a glab wrapper signed in to the agent account through GLAB_CONFIG_DIR.' } },
     { key: 'webhookToken', type: 'text', advanced: true, label: { zh: 'webhook 密钥', en: 'Webhook token' },
       hint: { zh: '非空时接受 POST ' + WEBHOOK_PATH + '（X-Gitlab-Token 头相同）：webhook 只当门铃，数据仍从 API 拉取。留空则不注册该路由。', en: 'When set, accepts POST ' + WEBHOOK_PATH + ' with the same X-Gitlab-Token header as a doorbell; data is still pulled through the API. Empty disables the route.' } },
     { key: 'pollSeconds', type: 'number', advanced: true, min: 30, max: 3600, label: { zh: '轮询间隔 / 秒', en: 'Polling interval / seconds' } },
     { key: 'failuresBeforeError', type: 'number', advanced: true, min: 1, max: 20, label: { zh: '连续失败几次后报告异常', en: 'Failed polls before reporting an error' } },
-    { key: 'observeIssues', type: 'switch', label: { zh: '接收项目里的新 issue', en: 'Receive new issues in the project' } },
-    { key: 'observeMrs', type: 'switch', label: { zh: '接收项目里的新 MR', en: 'Receive new merge requests in the project' } },
-    { key: 'observeNotes', type: 'switch', label: { zh: '接收项目里的评论', en: 'Receive notes in the project' } },
+    { key: 'observeIssues', type: 'switch', label: { zh: '接收这些项目里的新 issue', en: 'Receive new issues in the projects' } },
+    { key: 'observeMrs', type: 'switch', label: { zh: '接收这些项目里的新 MR', en: 'Receive new merge requests in the projects' } },
+    { key: 'observeNotes', type: 'switch', label: { zh: '接收这些项目里的评论', en: 'Receive notes in the projects' } },
   ],
   scope: ({ meta }, config) => {
-    const row = meta.kind === 'issue' ? 'issues' as const : meta.kind === 'mr' ? 'mrs' as const : 'notes' as const
-    const observed = row === 'issues' ? config.observeIssues : row === 'mrs' ? config.observeMrs : config.observeNotes
+    const project = String(meta.project ?? '')
+    if (!projectsOf(config).some(listed => sameName(listed, project))) {
+      return { listened: false, reason: 'project_not_listed' }
+    }
+    const row = `${project}:${meta.kind === 'issue' ? 'issues' : meta.kind === 'mr' ? 'mrs' : 'notes'}`
+    const observed = meta.kind === 'issue' ? config.observeIssues : meta.kind === 'mr' ? config.observeMrs : config.observeNotes
     return { listened: true, observed, row }
   },
   health: [SOURCE],
@@ -91,9 +98,13 @@ export const gitlabKind: SourceKind<GitlabConfig> = {
   threadContext: gitlabThreadContext,
   find: query => {
     const plain = /^([#!])(\d+)$/.exec(query.trim())
-    if (plain) return { threads: [`${SOURCE}:${plain[1] === '!' ? 'mr' : 'issue'}-${plain[2]}`], terms: [] }
-    const url = /\/([A-Za-z0-9_.\-/]+)\/-\/(issues|merge_requests)\/(\d+)/.exec(query)
-    return url ? { threads: [`${SOURCE}:${url[2] === 'issues' ? 'issue' : 'mr'}-${url[3]}`], terms: [] } : { threads: [], terms: [] }
+    if (plain) {
+      const kind = plain[1] === '!' ? 'mr' : 'issue'
+      return { threads: [], terms: [], // 不带项目前缀无法定位到唯一线程；给搜索词兜底
+      }
+    }
+    const url = /^https?:\/\/[^/]+\/([A-Za-z0-9_.\-/]+?)\/-\/(issues|merge_requests)\/(\d+)/.exec(query.trim())
+    return url ? { threads: [`${SOURCE}:${url[1]}:${url[2] === 'issues' ? 'issue' : 'mr'}-${url[3]}`], terms: [] } : { threads: [], terms: [] }
   },
   policy: {
     schema: z.object({ allowed: z.array(z.object({ id: z.string().min(1), name: z.string().trim().max(100).optional() }).strict()).default([]) }).strict(),
@@ -101,18 +112,28 @@ export const gitlabKind: SourceKind<GitlabConfig> = {
       { key: 'id', type: 'text', label: { zh: '账号', en: 'Account' } },
       { key: 'name', type: 'text', label: { zh: '名字', en: 'Name' }, optional: true }] }],
     explicit: { zh: '名单里的账号在 issue、MR 或评论里 @ 智能体的账号。', en: 'An account on the list mentions the agent in an issue, merge request, or note.' },
+    rows: stored => {
+      const config = GitlabConfigSchema.parse(stored)
+      return projectsOf(config).flatMap(project => (['issues', 'mrs', 'notes'] as const).map(scopeName => {
+        const observed = scopeName === 'issues' ? config.observeIssues : scopeName === 'mrs' ? config.observeMrs : config.observeNotes
+        const label = { issues: 'issue', mrs: 'MR', notes: '评论' }[scopeName]
+        return { id: `${project}:${scopeName}`, label: `${project} · ${label}`,
+          note: observed ? { zh: '接收全部', en: 'All received' } : { zh: '仅 @', en: '@ only' },
+          cells: { listedUnaddressed: observed, unlistedAddressed: true, unlistedUnaddressed: observed } }
+      }))
+    },
   },
   environment: {
     variables: [
       { key: 'DSH_SUPERAGENT_GITLAB_HOST', description: { zh: 'GitLab 实例地址', en: 'GitLab instance URL' } },
-      { key: 'DSH_SUPERAGENT_GITLAB_PROJECT', description: { zh: '智能体干活的 GitLab 项目', en: 'The GitLab project the agent works on' } },
+      { key: 'DSH_SUPERAGENT_GITLAB_PROJECT', description: { zh: '工单来源的 GitLab 项目；不是从 GitLab 来的工单为空', en: 'The GitLab project the ticket came from; empty when the ticket did not start on GitLab' } },
       { key: 'DSH_SUPERAGENT_GITLAB_ACCOUNT', description: { zh: '智能体的 GitLab 账号；glab 以它登录，除合并外的 GitLab 操作都用 glab', en: 'The agent\u2019s GitLab account; glab is signed in to it. Use glab for every GitLab operation except merging, and never another account or credential' } },
       { key: 'DSH_SUPERAGENT_GITLAB_COMMIT_EMAIL', description: { zh: '智能体账号的提交邮箱', en: 'Commit email of the agent\u2019s account' } },
       { key: 'DSH_SUPERAGENT_GITLAB_IID', description: { zh: '接下工单的 issue 或 MR 编号；工单不是从 GitLab 来的时为空', en: 'IID of the issue or merge request that started the ticket; empty when the ticket did not start on GitLab' } },
     ],
     values: ({ deployment, trigger }) => ({
       DSH_SUPERAGENT_GITLAB_HOST: deployment.gitlab?.host ?? '',
-      DSH_SUPERAGENT_GITLAB_PROJECT: deployment.gitlab?.project ?? '',
+      DSH_SUPERAGENT_GITLAB_PROJECT: trigger?.source === SOURCE ? String(trigger.meta.project ?? '') : (deployment.gitlab?.projects[0] ?? ''),
       DSH_SUPERAGENT_GITLAB_ACCOUNT: deployment.gitlab?.login ?? '',
       DSH_SUPERAGENT_GITLAB_COMMIT_EMAIL: deployment.gitlab?.noreply ?? '',
       DSH_SUPERAGENT_GITLAB_IID: trigger?.threads[0]?.source === SOURCE ? String(trigger.meta.iid ?? '') : '',
@@ -123,20 +144,27 @@ export const gitlabKind: SourceKind<GitlabConfig> = {
   } : {},
 }
 
-/** The configured project's numeric id, resolved once per process run (projects keep their id across renames). */
-async function projectId(ctx: SourceContext): Promise<number> {
-  const cached = ctx.state.get(KV.gitlab.project)
-  if (cached) return cached.id
-  const project = ProjectSchema.parse(await ctx.commands.glab(['api', `projects/${encodeURIComponent(ctx.deployment.gitlab!.project)}`]))
-  ctx.state.set(KV.gitlab.project, { id: project.id, path: project.path_with_namespace })
-  return project.id
+/** The configured projects' numeric ids by path, resolved once and cached (projects keep their id across renames). */
+async function projectIds(ctx: SourceContext, projects: string[]): Promise<Map<string, number>> {
+  const cached = ctx.state.get(KV.gitlab.projects) ?? {}
+  const map = new Map<string, number>()
+  for (const project of projects) {
+    const hit = cached[project]
+    if (hit) { map.set(project, hit); continue }
+    const resolved = ProjectSchema.parse(await ctx.commands.glab(['api', `projects/${encodeURIComponent(project)}`]))
+    cached[project] = resolved.id
+    map.set(project, resolved.id)
+  }
+  ctx.state.set(KV.gitlab.projects, cached)
+  return map
 }
 
-/** Takes in todos addressed to the agent on the configured project, oldest first, and moves the cursor past them. */
-export async function pollTodos(ctx: SourceContext, signal: AbortSignal): Promise<number> {
-  const id = await projectId(ctx)
+/** Takes in todos addressed to the agent on the configured projects, oldest first, and moves the cursor past them. */
+export async function pollTodos(ctx: SourceContext, config: GitlabConfig, signal: AbortSignal): Promise<number> {
+  const ids = await projectIds(ctx, projectsOf(config))
   const cursor = ctx.state.get(KV.gitlab.todos) ?? 0
   const page = z.array(z.unknown()).parse(await ctx.commands.withSignal(signal).glab(['api', 'todos?state=pending&per_page=100&order_by=id&sort=asc']))
+  const idByProjects = new Map([...ids.entries()].map(([path, id]) => [id, path]))
   let count = 0
   let max = cursor
   for (const item of page) {
@@ -146,13 +174,14 @@ export async function pollTodos(ctx: SourceContext, signal: AbortSignal): Promis
     const todo = parsed.data
     if (todo.id <= cursor) continue
     max = Math.max(max, todo.id)
-    if (todo.target.project_id !== id) continue
-    const trigger = todoTrigger(todo, ctx.deployment.gitlab)
+    const project = idByProjects.get(todo.target.project_id)
+    if (!project) continue
+    const trigger = todoTrigger(todo, project, ctx.deployment.gitlab)
     if (!trigger) continue
     await ctx.receive(trigger)
     count++
-    ctx.threads.describe(`${SOURCE}:${refId(trigger.meta.kind as 'issue' | 'mr', Number(trigger.meta.iid))}`,
-      { url: trigger.url, ...(todo.target.title ? { label: todo.target.title } : {}) })
+    ctx.threads.describe(`${SOURCE}:${refId(project, trigger.meta.kind as 'issue' | 'mr', Number(trigger.meta.iid))}`,
+      { url: trigger.url, ...(todo.target.title ? { label: todo.target.title } : {}), facts: { project: { label: { zh: '项目', en: 'Project' }, value: project } } })
   }
   ctx.state.set(KV.gitlab.todos, max)
   return count
@@ -160,13 +189,13 @@ export async function pollTodos(ctx: SourceContext, signal: AbortSignal): Promis
 
 /** Reads the notes of one subscribed thread after its cursor; the first read starts now and replays nothing. */
 async function pollNotes(ctx: SourceContext, thread: { key: string; ref: { id: string } }, signal: AbortSignal): Promise<number> {
-  const ref = parseRef(thread.ref.id)
+  const ref = parseRefId(thread.ref.id)
   if (!ref) return 0
   const since = ctx.state.get(KV.gitlab.notes(thread.key))
   const started = new Date().toISOString()
   if (!since) { ctx.state.set(KV.gitlab.notes(thread.key), cursorAt(started)); return 0 }
   const path = `${ref.kind === 'mr' ? 'merge_requests' : 'issues'}/${ref.iid}/notes?sort=asc&order_by=updated_at&per_page=100&updated_after=${encodeURIComponent(since)}`
-  const notes = await ctx.commands.withSignal(signal).glabPages(NoteSchema, path)
+  const notes = await ctx.commands.withSignal(signal).glabPagesOn(ref.project, NoteSchema, path)
   let count = 0
   for (const note of notes) {
     if (signal.aborted) throw new Error('The GitLab Source stopped during the poll')
@@ -178,31 +207,29 @@ async function pollNotes(ctx: SourceContext, thread: { key: string; ref: { id: s
   ctx.state.set(KV.gitlab.notes(thread.key), cursorAt(started))
   return count
 }
-const parseRef = (id: string): GitlabRef | undefined => {
-  const match = /^(issue|mr)-(\d+)$/.exec(id)
-  return match ? { kind: match[1] as 'issue' | 'mr', iid: Number(match[2]) } : undefined
-}
 
-/** Receives newly opened issues and merge requests while their observe switch is on, from the moment it is switched on. */
+/** Receives newly opened issues and merge requests of each configured project while their observe switch is on. */
 async function pollOpened(ctx: SourceContext, config: GitlabConfig, signal: AbortSignal): Promise<number> {
   let count = 0
-  for (const kind of ['issue', 'mr'] as const) {
-    if (kind === 'issue' ? !config.observeIssues : !config.observeMrs) continue
-    const cursorKey = KV.gitlab.opened(kind)
-    const since = ctx.state.get(cursorKey)
-    const started = new Date().toISOString()
-    if (!since) { ctx.state.set(cursorKey, cursorAt(started)); continue }
-    const path = `${kind === 'mr' ? 'merge_requests' : 'issues'}?state=opened&order_by=created_at&sort=asc&per_page=100&created_after=${encodeURIComponent(since)}`
-    const opened = await ctx.commands.withSignal(signal).glabPages(IssueOpenedSchema, path)
-    for (const item of opened) {
-      if (signal.aborted) throw new Error('The GitLab Source stopped during the poll')
-      const trigger = openedTrigger(kind, item, ctx.deployment.gitlab)
-      if (!trigger) continue
-      await ctx.receive(trigger)
-      count++
-      ctx.threads.describe(`${SOURCE}:${refId(kind, item.iid)}`, { url: trigger.url, ...(item.title ? { label: item.title } : {}) })
+  for (const project of projectsOf(config)) {
+    for (const kind of ['issue', 'mr'] as const) {
+      if (kind === 'issue' ? !config.observeIssues : !config.observeMrs) continue
+      const cursorKey = KV.gitlab.opened(project, kind)
+      const since = ctx.state.get(cursorKey)
+      const started = new Date().toISOString()
+      if (!since) { ctx.state.set(cursorKey, cursorAt(started)); continue }
+      const path = `${kind === 'mr' ? 'merge_requests' : 'issues'}?state=opened&order_by=created_at&sort=asc&per_page=100&created_after=${encodeURIComponent(since)}`
+      const opened = await ctx.commands.withSignal(signal).glabPagesOn(project, IssueOpenedSchema, path)
+      for (const item of opened) {
+        if (signal.aborted) throw new Error('The GitLab Source stopped during the poll')
+        const trigger = openedTrigger(project, kind, item, ctx.deployment.gitlab)
+        if (!trigger) continue
+        await ctx.receive(trigger)
+        count++
+        ctx.threads.describe(`${SOURCE}:${refId(project, kind, item.iid)}`, { url: trigger.url, ...(item.title ? { label: item.title } : {}), facts: { project: { label: { zh: '项目', en: 'Project' }, value: project } } })
+      }
+      ctx.state.set(cursorKey, cursorAt(started))
     }
-    ctx.state.set(cursorKey, cursorAt(started))
   }
   return count
 }
@@ -213,10 +240,10 @@ async function watch(ctx: SourceContext, signal: AbortSignal, doorbell: Doorbell
   let failures = 0
   while (!signal.aborted) {
     const config = ctx.config<GitlabConfig>(SOURCE)
-    if (!config || !config.project) ctx.report(SOURCE, health('paused', 'sourceOff'))
+    if (!config || !projectsOf(config).length) ctx.report(SOURCE, health('paused', 'sourceOff'))
     else {
       try {
-        const todos = await pollTodos(ctx, signal)
+        const todos = await pollTodos(ctx, config, signal)
         let notes = 0
         await pollEach(ctx, SOURCE, () => signal.aborted, async thread => { notes += await pollNotes(ctx, thread, signal) })
         const opened = await pollOpened(ctx, config, signal)
@@ -250,7 +277,7 @@ function registerWebhook(ctx: Context, source: SourceContext, doorbell: Doorbell
         const body = JSON.parse(await readBody(req)) as { project?: { path_with_namespace?: string } }
         // The payload is only a doorbell: reject nothing, trust nothing, pull the data through the API.
         const project = body?.project?.path_with_namespace
-        if (project && config.project && !sameName(project, config.project)) { json(res, 202, { ignored: 'other_project' }); return }
+        if (project && !projectsOf(config).some(listed => sameName(listed, project))) { json(res, 202, { ignored: 'other_project' }); return }
         doorbell.ring()
         json(res, 204, {})
       } catch (error) {

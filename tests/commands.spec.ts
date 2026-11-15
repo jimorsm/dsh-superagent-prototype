@@ -215,7 +215,7 @@ it('stops a running command when the signal of its work aborts, or the lifetime,
 })
 
 describe('gitlab operations', () => {
-  const gitlabDeployment = testDeployment({ gitlab: { cli: '/path/agent-glab', host: 'https://gitlab.example.com', project: 'devops/sandbox', login: 'agent-bot', noreply: 'n' } })
+  const gitlabDeployment = testDeployment({ gitlab: { cli: '/path/agent-glab', host: 'https://gitlab.example.com', projects: ['devops/sandbox'], login: 'agent-bot', noreply: 'n' } })
   it('calls the GitLab API restricted to the configured project', async () => {
     const commands = new Commands(() => gitlabDeployment, {}, new AbortController().signal)
     const glab = vi.spyOn(commands, 'glab').mockResolvedValue({})

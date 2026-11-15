@@ -14,6 +14,8 @@ export async function sendGitlab(host: Pick<SourceContext, 'commands'>, message:
   const { commands } = host
   const gitlab = commands.deployment.gitlab
   if (!gitlab) throw new Error('The GitLab Source is not configured')
+  const project = message.channel.address.project ?? gitlab.projects[0]
+  if (!project) throw new Error('Missing GitLab reply project')
   const kind = message.channel.address.kind === 'mr' ? 'merge_requests' : 'issues'
   const iid = message.channel.address.iid
   if (!iid) throw new Error('Missing GitLab reply target')
@@ -22,8 +24,8 @@ export async function sendGitlab(host: Pick<SourceContext, 'commands'>, message:
   try {
     const mine = (note: z.infer<typeof NoteSchema>) => sameName(note.author?.username ?? '', gitlab.login)
       && (note.body ?? '').includes(marker)
-    if ((await commands.glabPages(NoteSchema, path)).some(mine)) return 'sent'
-    await commands.glabApi(z.unknown(), path, '--method', 'POST', '-f', `body=${message.text}\n\n${marker}`)
+    if ((await commands.glabPagesOn(project, NoteSchema, path)).some(mine)) return 'sent'
+    await commands.glabApiOn(project, z.unknown(), path, '--method', 'POST', '-f', `body=${message.text}\n\n${marker}`)
     return 'sent'
   } catch (error) {
     if (gone(error)) return 'gone'
@@ -33,5 +35,6 @@ export async function sendGitlab(host: Pick<SourceContext, 'commands'>, message:
 export function gitlabLink(address: Record<string, string>, _links: ChannelLinks): ChannelLink {
   const iid = address.iid ?? ''
   const mr = address.kind === 'mr'
-  return { url: address.url ?? '', label: mr ? { zh: `GitLab MR !${iid}`, en: `GitLab MR !${iid}` } : { zh: `GitLab issue #${iid}`, en: `GitLab issue #${iid}` } }
+  const where = address.project ? `${address.project} ` : ''
+  return { url: address.url ?? '', label: mr ? { zh: `GitLab ${where}MR !${iid}`, en: `GitLab ${where}MR !${iid}` } : { zh: `GitLab ${where}issue #${iid}`, en: `GitLab ${where}issue #${iid}` } }
 }

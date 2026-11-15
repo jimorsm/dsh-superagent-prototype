@@ -105,8 +105,8 @@ describe('setup', () => {
 
 describe('gitlab forge', () => {
   it('reads the project from the GitLab Source and the account from its CLI, skipping worker shims', async () => {
-    const account = await resolveGitlab(machine(), { host: 'https://gitlab.example.com', project: 'devops/sandbox', cli: 'glab' }, probe, path)
-    expect(account).toEqual({ cli: join(dir, 'bin', 'glab'), host: 'https://gitlab.example.com', project: 'devops/sandbox',
+    const account = await resolveGitlab(machine(), { host: 'https://gitlab.example.com', projects: [{ project: 'devops/sandbox' }], cli: 'glab' }, probe, path)
+    expect(account).toEqual({ cli: join(dir, 'bin', 'glab'), host: 'https://gitlab.example.com', projects: ['devops/sandbox'],
       login: 'agent-bot', noreply: '7_agent-bot@users.noreply.gitlab.example.com' })
     // 全空 = 未配置，返回 undefined 而不是报错
     expect(await resolveGitlab(machine(), {}, probe, path)).toBeUndefined()
@@ -115,28 +115,28 @@ describe('gitlab forge', () => {
   it('names what gitlab setup needs and where it is set', async () => {
     const needs = (code: string, values: Record<string, unknown>, gitlab: unknown) =>
       expect(resolveGitlab(machine(), gitlab, probe, path)).rejects.toEqual(setupError('gitlab', code, values))
-    await needs('gitlabHostUnset', {}, { project: 'devops/sandbox', cli: 'glab' })
+    await needs('gitlabHostUnset', {}, { projects: [{ project: 'devops/sandbox' }], cli: 'glab' })
     // 主机地址格式由 schema 在保存时拦截（ZodError），不到 setup
     expect(() => GitlabAccountSchema.parse({ host: 'gitlab.example.com' })).toThrow()
     await needs('gitlabProjectUnset', {}, { host: 'https://gitlab.example.com', cli: 'glab' })
-    await needs('gitlabCliUnset', {}, { host: 'https://gitlab.example.com', project: 'devops/sandbox' })
+    await needs('gitlabCliUnset', {}, { host: 'https://gitlab.example.com', projects: [{ project: 'devops/sandbox' }] })
     await needs('gitlabCliMissing', { output: `${join(dir, 'missing')} is not an executable file` },
-      { host: 'https://gitlab.example.com', project: 'devops/sandbox', cli: join(dir, 'missing') })
-    await needs('gitlabCliSignedOut', {}, { host: 'https://gitlab.example.com', project: 'devops/sandbox', cli: program(join(dir, 'bin', 'glab-broken'), 'exit 1') })
-    await needs('gitlabCliNoAccount', {}, { host: 'https://gitlab.example.com', project: 'devops/sandbox', cli: program(join(dir, 'bin', 'glab-anon'), `echo '{}'`) })
+      { host: 'https://gitlab.example.com', projects: [{ project: 'devops/sandbox' }], cli: join(dir, 'missing') })
+    await needs('gitlabCliSignedOut', {}, { host: 'https://gitlab.example.com', projects: [{ project: 'devops/sandbox' }], cli: program(join(dir, 'bin', 'glab-broken'), 'exit 1') })
+    await needs('gitlabCliNoAccount', {}, { host: 'https://gitlab.example.com', projects: [{ project: 'devops/sandbox' }], cli: program(join(dir, 'bin', 'glab-anon'), `echo '{}'`) })
     const unreadable = program(join(dir, 'bin', 'glab-outsider'),
       `case "\$*" in\n  "api user") echo '{"username":"agent-bot","id":7}' ;;\n  *) echo 'HTTP 404' >&2; exit 1 ;;\nesac`)
     await needs('gitlabProjectUnreadable', { account: 'agent-bot', project: 'devops/sandbox' },
-      { host: 'https://gitlab.example.com', project: 'devops/sandbox', cli: unreadable })
+      { host: 'https://gitlab.example.com', projects: [{ project: 'devops/sandbox' }], cli: unreadable })
     glab(join(dir, 'bin', 'glab-reader'), 'agent-bot', 10)
     await needs('gitlabProjectReadOnly', { account: 'agent-bot', project: 'devops/sandbox' },
-      { host: 'https://gitlab.example.com', project: 'devops/sandbox', cli: 'glab-reader' })
+      { host: 'https://gitlab.example.com', projects: [{ project: 'devops/sandbox' }], cli: 'glab-reader' })
   })
   it('composes forges: gitlab alone is enough, and none is a setup error', async () => {
-    const gitlabOnly = await resolveForges(machine(), { gitlab: { host: 'https://gitlab.example.com', project: 'devops/sandbox', cli: 'glab' } }, probe, path)
+    const gitlabOnly = await resolveForges(machine(), { gitlab: { host: 'https://gitlab.example.com', projects: [{ project: 'devops/sandbox' }], cli: 'glab' } }, probe, path)
     expect(gitlabOnly).toMatchObject({ repository: '', gitlab: { login: 'agent-bot' } })
     expect(gitlabOnly).not.toHaveProperty('github')
-    const both = await resolveForges(machine(), { github: { repository: 'acme/widgets', cli: 'gh' }, gitlab: { host: 'https://gitlab.example.com', project: 'devops/sandbox', cli: 'glab' } }, probe, path)
+    const both = await resolveForges(machine(), { github: { repository: 'acme/widgets', cli: 'gh' }, gitlab: { host: 'https://gitlab.example.com', projects: [{ project: 'devops/sandbox' }], cli: 'glab' } }, probe, path)
     expect(both).toMatchObject({ repository: 'acme/widgets', github: { login: 'Agent-Bot' }, gitlab: { login: 'agent-bot' } })
     await expect(resolveForges(machine(), {}, probe, path)).rejects.toEqual(setupError('deployment', 'forgeUnset', {}))
   })

@@ -13,11 +13,12 @@ const noteMessage = (note: GitlabNote): ContextMessage => ({
 export const gitlabThreadContext: ThreadContext<GitlabConfig> = {
   messageId: (trigger: Trigger) => String(trigger.meta.noteId ?? ''),
   read: async (commands: Commands, trigger: Trigger, _part, cursor): Promise<ContextPart> => {
+    const project = String(trigger.meta.project ?? '')
     const kind = trigger.meta.kind === 'mr' ? 'merge_requests' : 'issues'
     const iid = Number(trigger.meta.iid)
-    if (!iid) throw new Error('The Trigger names no GitLab thread')
+    if (!project || !iid) throw new Error('The Trigger names no GitLab thread')
     const page = Math.max(1, Number(cursor) || 1)
-    const notes = await commands.glabPages(NoteSchema, `${kind}/${iid}/notes?sort=asc&order_by=updated_at&per_page=100&page=${page}`)
+    const notes = await commands.glabPagesOn(project, NoteSchema, `${kind}/${iid}/notes?sort=asc&order_by=updated_at&per_page=100&page=${page}`)
     const messages = notes.map(noteMessage)
     return { messages, ...(notes.length === 100 ? { next: String(page + 1) } : {}), body: { messages } }
   },

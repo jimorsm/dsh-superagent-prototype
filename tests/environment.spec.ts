@@ -187,7 +187,7 @@ describe('the repository the host\'s environment names', () => {
 
 describe('gitlab forge environment', () => {
   const gitlabDeployment = () => testDeployment({ stateDir: dir, github: undefined,
-    gitlab: { cli: join(dir, 'real', 'glab'), host: 'https://gitlab.example.com', project: 'devops/sandbox', login: 'agent-bot', noreply: '7_agent-bot@users.noreply.gitlab.example.com' } })
+    gitlab: { cli: join(dir, 'real', 'glab'), host: 'https://gitlab.example.com', projects: ['devops/sandbox'], login: 'agent-bot', noreply: '7_agent-bot@users.noreply.gitlab.example.com' } })
   it('runs glab through the shim, fails gh honestly, and writes the gitlab credential helper and url rewrite', async () => {
     program(join(dir, 'real', 'glab'), 'echo glab-real "$@"')
     await writeEnvironment(gitlabDeployment(), [])
