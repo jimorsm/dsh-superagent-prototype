@@ -125,22 +125,24 @@ describe('sendGitlab', () => {
   const reply = { id: 'stable-op', channel: gitlabChannel(SANDBOX, 'issue', 8), text: '完成', kind: 'reply' as const }
   it('posts a note to the addressed project with the idempotency marker, and maps 404 to gone', async () => {
     const commands = new Commands(() => deployment, {}, new AbortController().signal)
-    const glab = vi.spyOn(commands, 'glab')
-    glab.mockResolvedValueOnce([[{ id: 1, body: '别人说的', author: { username: 'bob' }, system: false, created_at: 'x' }]])
-      .mockResolvedValueOnce({})
+    const run = vi.spyOn(commands, 'run').mockResolvedValue('[]')
+    const glab = vi.spyOn(commands, 'glab').mockResolvedValue({})
     expect(await sendGitlab({ commands }, reply)).toBe('sent')
-    expect(glab.mock.calls[1]![0]).toEqual(['api', `projects/${encodeURIComponent(SANDBOX)}/issues/8/notes`, '--method', 'POST', '-f', expect.stringContaining('<!-- dsh-superagent:stable-op -->')])
-    glab.mockResolvedValueOnce([[{ id: 2, body: 'x <!-- dsh-superagent:stable-op -->', author: { username: 'agent-bot' }, system: false, created_at: 'x' }]])
+    // 发帖走 glab（项目前缀 + 幂等 marker），列表走 run（原始文本拼页）
+    expect(glab.mock.calls[0]![0][1]).toBe(`projects/${encodeURIComponent(SANDBOX)}/issues/8/notes`)
+    expect(String(glab.mock.calls[0]![0].at(-1))).toContain('<!-- dsh-superagent:stable-op -->')
+    run.mockResolvedValue(JSON.stringify([note(2, { author: { username: 'agent-bot' }, body: 'x <!-- dsh-superagent:stable-op -->' })]))
     expect(await sendGitlab({ commands }, reply)).toBe('sent')
-    expect(glab).toHaveBeenCalledTimes(3)  // list → POST → list（marker 命中后不再 POST）
-    glab.mockRejectedValueOnce(new CliError('Not Found', 404))
+    expect(glab).toHaveBeenCalledTimes(1)  // marker 命中后不再 POST
+    run.mockRejectedValueOnce(new CliError('Not Found', 404))
     expect(await sendGitlab({ commands }, reply)).toBe('gone')
-    glab.mockRejectedValueOnce(new CliError('boom'))
+    run.mockRejectedValueOnce(new CliError('boom'))
     await expect(sendGitlab({ commands }, reply)).rejects.toThrow('boom')
   })
   it('routes a reply to another configured project, and refuses an unconfigured one', async () => {
     const commands = new Commands(() => deployment, {}, new AbortController().signal)
-    const glab = vi.spyOn(commands, 'glab').mockResolvedValue([])
+    const run = vi.spyOn(commands, 'run').mockResolvedValue('[]')
+    const glab = vi.spyOn(commands, 'glab').mockResolvedValue({})
     await sendGitlab({ commands }, { id: 'm2', channel: gitlabChannel(WIDGETS, 'mr', 3), text: '好了', kind: 'reply' })
     expect(glab.mock.calls[0]![0][1]).toBe(`projects/${encodeURIComponent(WIDGETS)}/merge_requests/3/notes`)
     await expect(sendGitlab({ commands }, { id: 'm3', channel: gitlabChannel('devops/elsewhere', 'issue', 1), text: 'x', kind: 'reply' })).rejects.toThrow('restricted to the configured projects')
@@ -151,13 +153,13 @@ describe('gitlabThreadContext', () => {
   it('reads one page of notes from the trigger project and hands out the next page cursor while pages stay full', async () => {
     const commands = new Commands(() => deployment, {}, new AbortController().signal)
     const notes = Array.from({ length: 100 }, (_, i) => note(100 + i))
-    const glab = vi.spyOn(commands, 'glab').mockResolvedValue([notes])
+    const run = vi.spyOn(commands, 'run').mockResolvedValue(JSON.stringify(notes))
     const trigger = noteTrigger(notes[0]!, { project: WIDGETS, kind: 'issue', iid: 8 }, GITLAB)!
     const part = await gitlabThreadContext.read(commands, trigger, 'thread', undefined, {} as never)
     expect(part.messages).toHaveLength(100)
     expect(part.next).toBe('2')
     expect(part.messages[0]).toMatchObject({ id: '100', from: 'alice', text: '好' })
-    expect(String(glab.mock.calls[0]![0][1])).toContain(`projects/${encodeURIComponent(WIDGETS)}/issues/8/notes`)
+    expect(String(run.mock.calls[0]![1][1])).toContain(`projects/${encodeURIComponent(WIDGETS)}/issues/8/notes`)
     expect(gitlabThreadContext.messageId(trigger)).toBe('100')
   })
 })

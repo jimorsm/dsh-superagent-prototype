@@ -106,13 +106,17 @@ export class Commands {
   }
   /** Fetches all pages of a GitLab API list within the configured project, skipping items that fail schema validation. */
   async glabPages<T>(item: z.ZodType<T>, path: string, tally?: Tally): Promise<T[]> {
-    const pages = z.array(z.array(z.unknown())).parse(await this.glab(['api', this.glabPath(path), '--paginate', '--slurp']))
-    return validItems(item, pages.flat(), tally)
+    return validItems(item, await this.glabList(path), tally)
   }
   /** `glabPages` within the named configured project. */
   async glabPagesOn<T>(project: string, item: z.ZodType<T>, path: string, tally?: Tally): Promise<T[]> {
-    const pages = z.array(z.array(z.unknown())).parse(await this.glab(['api', this.glabPath(path, project), '--paginate', '--slurp']))
-    return validItems(item, pages.flat(), tally)
+    return validItems(item, await this.glabList(path, project), tally)
+  }
+  /** glab has no --slurp: `--paginate` prints each page's JSON array back to back, so splice them into one array here. */
+  private async glabList(path: string, project?: string): Promise<unknown[]> {
+    const text = (await this.run(this.gitlabCli, ['api', this.glabPath(path, project), '--paginate'])).trim()
+    if (!text) return []
+    return JSON.parse('[' + text.replace(/^\[/, '').replace(/\]$/, '').replace(/\]\s*\[/g, ',') + ']') as unknown[]
   }
   /**
    * Calls the GitHub API on a path within the configured repository, validating JSON output when a schema is provided

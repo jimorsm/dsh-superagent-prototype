@@ -224,6 +224,16 @@ describe('gitlab operations', () => {
     await expect(commands.glabApi('../version')).rejects.toThrow('restricted to the configured project')
     await expect(commands.glabApi('/absolute')).rejects.toThrow('restricted to the configured project')
   })
+it('splices glab --paginate output (arrays back to back, no --slurp) into one list', async () => {
+    const commands = new Commands(() => gitlabDeployment, {}, new AbortController().signal)
+    const run = vi.spyOn(commands, 'run').mockResolvedValue('[{"id":1}]\n[{"id":2},{"id":3}]')
+    expect(await commands.glabPages(z.object({ id: z.number() }), 'issues/8/notes')).toEqual([{ id: 1 }, { id: 2 }, { id: 3 }])
+    expect(run.mock.calls[0]![1]).toEqual(['api', 'projects/devops%2Fsandbox/issues/8/notes', '--paginate'])
+    // 空页与单页
+    run.mockResolvedValue('[]')
+    expect(await commands.glabPages(z.object({ id: z.number() }), 'issues/8/notes')).toEqual([])
+  })
+
   it('refuses GitLab commands when the deployment has no GitLab forge', async () => {
     const commands = new Commands(() => testDeployment({ gitlab: undefined }), {}, new AbortController().signal)
     await expect(commands.glab(['api', 'user'])).rejects.toThrow('The GitLab Source is not configured')
