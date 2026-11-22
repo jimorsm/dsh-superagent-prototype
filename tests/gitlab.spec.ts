@@ -11,7 +11,7 @@ import { Store } from '../src/app/store.ts'
 import { SettingsSchema, settingsPolicy } from '../src/policy.ts'
 import { sourceContextOf, type SourceContextDeps } from '../src/app/source-context.ts'
 import { testDeployment } from './fixtures/deployment.ts'
-import { gitlabKind, pollTodos } from '../src/sources/gitlab.ts'
+import { gitlabKind, pollNotes, pollTodos } from '../src/sources/gitlab.ts'
 import { noteTrigger, openedTrigger, todoTrigger, gitlabChannel, parseRefId, type GitlabNote, type GitlabTodo } from '../src/sources/gitlab-trigger.ts'
 import { sendGitlab } from '../src/sources/gitlab-channel.ts'
 import { gitlabThreadContext } from '../src/sources/gitlab-read.ts'
@@ -111,12 +111,41 @@ describe('pollTodos', () => {
       return [todo(11), todo(12, { target: { iid: 9, project_id: 555 }, target_url: 'https://gitlab.example.com/devops/widgets/-/issues/9' }),
         todo(13, { target: { iid: 1, project_id: 999 } }), todo(14, { action_name: 'assigned' })]
     })
-    expect(await pollTodos(h.ctx, configOf(), new AbortController().signal)).toBe(3)
+    const first = await pollTodos(h.ctx, configOf(), new AbortController().signal)
+    expect(first.count).toBe(3)
+    expect(first.threads.map(thread => thread.key).sort()).toEqual(['gitlab:devops/sandbox:issue-8', 'gitlab:devops/widgets:issue-9'])
     expect(h.store.get(KV.gitlab.todos)).toBe(14)
     expect(h.receive.mock.calls.map(call => (call[0] as Trigger).threads[0]!.id).sort()).toEqual(['devops/sandbox:issue-8', 'devops/sandbox:issue-8', 'devops/widgets:issue-9'])
     expect(h.engine.candidate(key('gitlab', 'todo-11'))?.strength).toBe('explicit')
     glab.mockImplementation(async () => [todo(14, { action_name: 'assigned' })])
-    expect(await pollTodos(h.ctx, configOf(), new AbortController().signal)).toBe(0)
+    expect((await pollTodos(h.ctx, configOf(), new AbortController().signal)).count).toBe(0)
+    h.store.close()
+  })
+})
+
+describe('todo-watched notes', () => {
+  it('hears a re-mention on a thread whose pending todo was already consumed', async () => {
+    const h = host()
+    vi.spyOn(h.commands, 'withSignal').mockReturnValue(h.commands)
+    h.store.set(KV.gitlab.todos, 15)  // todo 11 已被游标越过：模拟「同目标的唯一 pending todo 早已被接单」
+    const glab = vi.spyOn(h.commands, 'glab')
+    glab.mockImplementation(async (args: string[]) => {
+      const path = String(args[1] ?? '')
+      if (path === `projects/${encodeURIComponent(SANDBOX)}`) return { id: 424, path_with_namespace: SANDBOX }
+      if (path === `projects/${encodeURIComponent(WIDGETS)}`) return { id: 555, path_with_namespace: WIDGETS }
+      return [todo(11)]
+    })
+    const first = await pollTodos(h.ctx, configOf(), new AbortController().signal)
+    expect(first.count).toBe(0)  // 重复 @ 不产生新 todo——这正是盲区场景
+    expect(first.threads.map(thread => thread.key)).toEqual(['gitlab:devops/sandbox:issue-8'])
+    const signal = new AbortController().signal
+    const run = vi.spyOn(h.commands, 'run').mockResolvedValue('[]')
+    expect(await pollNotes(h.ctx, first.threads[0]!, signal)).toBe(0)  // 首次只初始化游标，不回放老评论
+    run.mockResolvedValue(JSON.stringify([{ id: 50, body: '@agent-bot 再来一次', author: { username: 'alice' }, system: false, created_at: '2026-11-22T05:00:00Z' }]))
+    expect(await pollNotes(h.ctx, first.threads[0]!, signal)).toBe(1)
+    const trigger = h.receive.mock.calls.at(-1)![0] as Trigger
+    expect(trigger.addressed).toBe('mention')
+    expect(trigger.meta.noteId).toBe(50)
     h.store.close()
   })
 })

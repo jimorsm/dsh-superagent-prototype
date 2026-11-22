@@ -159,36 +159,47 @@ async function projectIds(ctx: SourceContext, projects: string[]): Promise<Map<s
   return map
 }
 
-/** Takes in todos addressed to the agent on the configured projects, oldest first, and moves the cursor past them. */
-export async function pollTodos(ctx: SourceContext, config: GitlabConfig, signal: AbortSignal): Promise<number> {
+/** A Thread that still holds a pending todo addressed to the agent. */
+export interface TodoWatch { key: string; ref: { id: string } }
+
+/** Takes in todos addressed to the agent on the configured projects, oldest first, moves the cursor past them, and
+ * lists every Thread still holding a pending todo: GitLab creates at most one pending todo per user+target, so a
+ * re-mention on such a target produces no new todo and its updated_at never moves — the watch loop polls the notes
+ * of these Threads directly to hear re-mentions. */
+export async function pollTodos(ctx: SourceContext, config: GitlabConfig, signal: AbortSignal): Promise<{ count: number; threads: TodoWatch[] }> {
   const ids = await projectIds(ctx, projectsOf(config))
   const cursor = ctx.state.get(KV.gitlab.todos) ?? 0
   const page = z.array(z.unknown()).parse(await ctx.commands.withSignal(signal).glab(['api', 'todos?state=pending&per_page=100&order_by=id&sort=asc']))
   const idByProjects = new Map([...ids.entries()].map(([path, id]) => [id, path]))
   let count = 0
   let max = cursor
+  const threads = new Map<string, TodoWatch>()
   for (const item of page) {
     if (signal.aborted) throw new Error('The GitLab Source stopped during the poll')
     const parsed = TodoSchema.safeParse(item)
     if (!parsed.success) continue
     const todo = parsed.data
-    if (todo.id <= cursor) continue
-    max = Math.max(max, todo.id)
     const project = idByProjects.get(todo.target.project_id)
     if (!project) continue
+    const kind = todo.target_type === 'MergeRequest' ? 'mr' as const : todo.target_type === 'Issue' ? 'issue' as const : undefined
+    if (!kind) continue
+    const id = refId(project, kind, todo.target.iid)
+    threads.set(id, { key: `${SOURCE}:${id}`, ref: { id } })
+    if (todo.id <= cursor) continue
+    max = Math.max(max, todo.id)
     const trigger = todoTrigger(todo, project, ctx.deployment.gitlab)
     if (!trigger) continue
     await ctx.receive(trigger)
     count++
-    ctx.threads.describe(`${SOURCE}:${refId(project, trigger.meta.kind as 'issue' | 'mr', Number(trigger.meta.iid))}`,
+    ctx.threads.describe(`${SOURCE}:${id}`,
       { url: trigger.url, ...(todo.target.title ? { label: todo.target.title } : {}), facts: { project: { label: { zh: '项目', en: 'Project' }, value: project } } })
   }
   ctx.state.set(KV.gitlab.todos, max)
-  return count
+  return { count, threads: [...threads.values()] }
 }
 
-/** Reads the notes of one subscribed thread after its cursor; the first read starts now and replays nothing. */
-async function pollNotes(ctx: SourceContext, thread: { key: string; ref: { id: string } }, signal: AbortSignal): Promise<number> {
+/** Reads the notes of one subscribed or todo-watched thread after its cursor; the first read starts now and replays nothing. */
+export async function pollNotes(ctx: SourceContext, thread: { key: string; ref: { id: string } }, signal: AbortSignal): Promise<number> {
   const ref = parseRefId(thread.ref.id)
   if (!ref) return 0
   const since = ctx.state.get(KV.gitlab.notes(thread.key))
@@ -243,9 +254,11 @@ async function watch(ctx: SourceContext, signal: AbortSignal, doorbell: Doorbell
     if (!config || !projectsOf(config).length) ctx.report(SOURCE, health('paused', 'sourceOff'))
     else {
       try {
-        const todos = await pollTodos(ctx, config, signal)
+        const { count: todos, threads: todoWatches } = await pollTodos(ctx, config, signal)
         let notes = 0
         await pollEach(ctx, SOURCE, () => signal.aborted, async thread => { notes += await pollNotes(ctx, thread, signal) })
+        const subscribed = new Set(ctx.threads.subscribed(SOURCE).map(thread => thread.key))
+        for (const thread of todoWatches) { if (!subscribed.has(thread.key)) notes += await pollNotes(ctx, thread, signal) }
         const opened = await pollOpened(ctx, config, signal)
         failures = 0
         ctx.report(SOURCE, { state: 'ready', detail: `${todos} todos, ${notes} notes, ${opened} opened`, at: new Date().toISOString() })
