@@ -10,6 +10,7 @@ import { cursorAt, pause, pollThreads as pollEach } from './poll.ts'
 import type { Localized, SourceKind } from './kind.ts'
 import { NoteSchema, openedTrigger, noteTrigger, todoTrigger, TodoSchema, parseRefId, refId, SOURCE } from './gitlab-trigger.ts'
 import { gitlabLink, sendGitlab } from './gitlab-channel.ts'
+import { observeMr, readMr } from './gitlab-mr.ts'
 import { gitlabThreadContext } from './gitlab-read.ts'
 import { sameName } from '../infra/text.ts'
 
@@ -245,6 +246,28 @@ async function pollOpened(ctx: SourceContext, config: GitlabConfig, signal: Abor
   return count
 }
 
+/** Observes the MRs of each configured project for ticket binding and lifecycle: the first round binds the open
+ * ones (observation is not intake, so nothing is replayed as a Trigger), later rounds reconcile what changed. */
+async function pollMrs(ctx: SourceContext, config: GitlabConfig, signal: AbortSignal): Promise<number> {
+  let count = 0
+  for (const project of projectsOf(config)) {
+    if (signal.aborted) throw new Error('The GitLab Source stopped during the poll')
+    const cursor = ctx.state.get(KV.gitlab.mrsUpdated(project))
+    const started = new Date().toISOString()
+    const path = cursor
+      ? `merge_requests?updated_after=${encodeURIComponent(cursor)}&order_by=updated_at&sort=asc&per_page=100&state=all`
+      : 'merge_requests?state=opened&per_page=100'
+    const items = await ctx.commands.withSignal(signal).glabPagesOn(project, z.looseObject({ iid: z.number().int() }), path)
+    for (const item of items) {
+      if (signal.aborted) throw new Error('The GitLab Source stopped during the poll')
+      await observeMr(ctx, project, await readMr(ctx, project, item.iid, signal))
+      count++
+    }
+    ctx.state.set(KV.gitlab.mrsUpdated(project), cursorAt(started))
+  }
+  return count
+}
+
 async function watch(ctx: SourceContext, signal: AbortSignal, doorbell: Doorbell): Promise<void> {
   await ctx.ready
   if (!ctx.configured()) { ctx.report(SOURCE, health('paused', 'setupPending')); return }
@@ -260,8 +283,9 @@ async function watch(ctx: SourceContext, signal: AbortSignal, doorbell: Doorbell
         const subscribed = new Set(ctx.threads.subscribed(SOURCE).map(thread => thread.key))
         for (const thread of todoWatches) { if (!subscribed.has(thread.key)) notes += await pollNotes(ctx, thread, signal) }
         const opened = await pollOpened(ctx, config, signal)
+        const mrs = await pollMrs(ctx, config, signal)
         failures = 0
-        ctx.report(SOURCE, { state: 'ready', detail: `${todos} todos, ${notes} notes, ${opened} opened`, at: new Date().toISOString() })
+        ctx.report(SOURCE, { state: 'ready', detail: `${todos} todos, ${notes} notes, ${opened} opened, ${mrs} mrs`, at: new Date().toISOString() })
       } catch (error) {
         if (signal.aborted) return
         failures += 1

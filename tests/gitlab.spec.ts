@@ -141,7 +141,7 @@ describe('todo-watched notes', () => {
     const signal = new AbortController().signal
     const run = vi.spyOn(h.commands, 'run').mockResolvedValue('[]')
     expect(await pollNotes(h.ctx, first.threads[0]!, signal)).toBe(0)  // 首次只初始化游标，不回放老评论
-    run.mockResolvedValue(JSON.stringify([{ id: 50, body: '@agent-bot 再来一次', author: { username: 'alice' }, system: false, created_at: '2026-11-22T05:00:00Z' }]))
+    run.mockResolvedValue(JSON.stringify({ id: 50, body: '@agent-bot 再来一次', author: { username: 'alice' }, system: false, created_at: '2026-11-22T05:00:00Z' }))
     expect(await pollNotes(h.ctx, first.threads[0]!, signal)).toBe(1)
     const trigger = h.receive.mock.calls.at(-1)![0] as Trigger
     expect(trigger.addressed).toBe('mention')
@@ -154,13 +154,13 @@ describe('sendGitlab', () => {
   const reply = { id: 'stable-op', channel: gitlabChannel(SANDBOX, 'issue', 8), text: '完成', kind: 'reply' as const }
   it('posts a note to the addressed project with the idempotency marker, and maps 404 to gone', async () => {
     const commands = new Commands(() => deployment, {}, new AbortController().signal)
-    const run = vi.spyOn(commands, 'run').mockResolvedValue('[]')
+    const run = vi.spyOn(commands, 'run').mockResolvedValue('')
     const glab = vi.spyOn(commands, 'glab').mockResolvedValue({})
     expect(await sendGitlab({ commands }, reply)).toBe('sent')
     // 发帖走 glab（项目前缀 + 幂等 marker），列表走 run（原始文本拼页）
     expect(glab.mock.calls[0]![0][1]).toBe(`projects/${encodeURIComponent(SANDBOX)}/issues/8/notes`)
     expect(String(glab.mock.calls[0]![0].at(-1))).toContain('<!-- dsh-superagent:stable-op -->')
-    run.mockResolvedValue(JSON.stringify([note(2, { author: { username: 'agent-bot' }, body: 'x <!-- dsh-superagent:stable-op -->' })]))
+    run.mockResolvedValue(JSON.stringify(note(2, { author: { username: 'agent-bot' }, body: 'x <!-- dsh-superagent:stable-op -->' })))
     expect(await sendGitlab({ commands }, reply)).toBe('sent')
     expect(glab).toHaveBeenCalledTimes(1)  // marker 命中后不再 POST
     run.mockRejectedValueOnce(new CliError('Not Found', 404))
@@ -170,7 +170,7 @@ describe('sendGitlab', () => {
   })
   it('routes a reply to another configured project, and refuses an unconfigured one', async () => {
     const commands = new Commands(() => deployment, {}, new AbortController().signal)
-    const run = vi.spyOn(commands, 'run').mockResolvedValue('[]')
+    const run = vi.spyOn(commands, 'run').mockResolvedValue('')
     const glab = vi.spyOn(commands, 'glab').mockResolvedValue({})
     await sendGitlab({ commands }, { id: 'm2', channel: gitlabChannel(WIDGETS, 'mr', 3), text: '好了', kind: 'reply' })
     expect(glab.mock.calls[0]![0][1]).toBe(`projects/${encodeURIComponent(WIDGETS)}/merge_requests/3/notes`)
@@ -182,7 +182,7 @@ describe('gitlabThreadContext', () => {
   it('reads one page of notes from the trigger project and hands out the next page cursor while pages stay full', async () => {
     const commands = new Commands(() => deployment, {}, new AbortController().signal)
     const notes = Array.from({ length: 100 }, (_, i) => note(100 + i))
-    const run = vi.spyOn(commands, 'run').mockResolvedValue(JSON.stringify(notes))
+    const run = vi.spyOn(commands, 'run').mockResolvedValue(notes.map(note => JSON.stringify(note)).join('\n'))
     const trigger = noteTrigger(notes[0]!, { project: WIDGETS, kind: 'issue', iid: 8 }, GITLAB)!
     const part = await gitlabThreadContext.read(commands, trigger, 'thread', undefined, {} as never)
     expect(part.messages).toHaveLength(100)

@@ -56,7 +56,8 @@ export const KV = {
    * GitLab Source: the configured project's numeric id; last-seen todo id; per-thread and per-opened-stream read cursors.
    */
   gitlab: { projects: record<Record<string, number>>('gitlab-projects'), todos: record<number>('gitlab-todos'),
-    notes: family<string, [thread: string]>('gitlab-notes:'), opened: family<string, [project: string, stream: string]>('gitlab-opened:') },
+    notes: family<string, [thread: string]>('gitlab-notes:'), opened: family<string, [project: string, stream: string]>('gitlab-opened:'),
+    /** Per-project MR lifecycle read cursor (updated_after). */ mrsUpdated: family<string, [project: string]>('gitlab-mrs-updated:') },
   feishu: { chats: record<Record<string, boolean>>('feishu-chats'), history: family<string, [chat: string]>('feishu-history:'),
     topics: family<Record<string, string>, [chat: string]>('feishu-history-threads:'),
     seen: family<string[], [thread: string]>('thread-seen:'), initialized: family<boolean, [thread: string]>('thread-initialized:') },

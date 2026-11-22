@@ -112,11 +112,10 @@ export class Commands {
   async glabPagesOn<T>(project: string, item: z.ZodType<T>, path: string, tally?: Tally): Promise<T[]> {
     return validItems(item, await this.glabList(path, project), tally)
   }
-  /** glab has no --slurp: `--paginate` prints each page's JSON array back to back, so splice them into one array here. */
+  /** glab has no --slurp: `--paginate --output ndjson` prints one item per line across all pages. */
   private async glabList(path: string, project?: string): Promise<unknown[]> {
-    const text = (await this.run(this.gitlabCli, ['api', this.glabPath(path, project), '--paginate'])).trim()
-    if (!text) return []
-    return JSON.parse('[' + text.replace(/^\[/, '').replace(/\]$/, '').replace(/\]\s*\[/g, ',') + ']') as unknown[]
+    const text = await this.run(this.gitlabCli, ['api', this.glabPath(path, project), '--paginate', '--output', 'ndjson'])
+    return text.split('\n').filter(line => line.trim()).map(line => JSON.parse(line) as unknown)
   }
   /**
    * Calls the GitHub API on a path within the configured repository, validating JSON output when a schema is provided

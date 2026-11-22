@@ -226,9 +226,9 @@ describe('gitlab operations', () => {
   })
 it('splices glab --paginate output (arrays back to back, no --slurp) into one list', async () => {
     const commands = new Commands(() => gitlabDeployment, {}, new AbortController().signal)
-    const run = vi.spyOn(commands, 'run').mockResolvedValue('[{"id":1}]\n[{"id":2},{"id":3}]')
+    const run = vi.spyOn(commands, 'run').mockResolvedValue('{"id":1}\n{"id":2}\n{"id":3}\n')
     expect(await commands.glabPages(z.object({ id: z.number() }), 'issues/8/notes')).toEqual([{ id: 1 }, { id: 2 }, { id: 3 }])
-    expect(run.mock.calls[0]![1]).toEqual(['api', 'projects/devops%2Fsandbox/issues/8/notes', '--paginate'])
+    expect(run.mock.calls[0]![1]).toEqual(['api', 'projects/devops%2Fsandbox/issues/8/notes', '--paginate', '--output', 'ndjson'])
     // 空页与单页
     run.mockResolvedValue('[]')
     expect(await commands.glabPages(z.object({ id: z.number() }), 'issues/8/notes')).toEqual([])
