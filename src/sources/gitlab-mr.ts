@@ -88,7 +88,8 @@ export async function observeMr(ctx: SourceContext, project: string, mr: Mr): Pr
     if (ticket && (reopened || mrsOf(ticket, true).every(ref => mrThreadKey(ref) === key_))) claimMr(ctx, ticket.id, project, mr)
   }
   ctx.threads.describe(mrThreadKey({ project, kind: 'mr', iid: mr.iid }),
-    { facts: { autoMerge: !done && mr.merge_when_pipeline_succeeds ? AUTO_MERGE_ON : null } })
+    { facts: { autoMerge: !done && mr.merge_when_pipeline_succeeds ? AUTO_MERGE_ON : null,
+      ...(mr.head_pipeline?.status ? { pipeline: { label: { zh: '流水线', en: 'Pipeline' }, value: mr.head_pipeline.status } } : {}) } })
   return done
 }
 function bind(ctx: SourceContext, ticketId: string, project: string, mr: Mr, own: boolean): void {
