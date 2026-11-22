@@ -6,7 +6,7 @@ import { z } from 'zod'
 import { GitlabAccountSchema } from '../deployment.ts'
 import { KV } from '../kv.ts'
 import { health, sourceContext, type SourceContext } from './host.ts'
-import { cursorAt, pause, pollThreads as pollEach } from './poll.ts'
+import { cursorAt, pause } from './poll.ts'
 import type { Localized, SourceKind } from './kind.ts'
 import { NoteSchema, openedTrigger, noteTrigger, todoTrigger, TodoSchema, parseRefId, refId, SOURCE } from './gitlab-trigger.ts'
 import { gitlabLink, sendGitlab } from './gitlab-channel.ts'
@@ -220,51 +220,68 @@ export async function pollNotes(ctx: SourceContext, thread: { key: string; ref: 
   return count
 }
 
-/** Receives newly opened issues and merge requests of each configured project while their observe switch is on. */
-async function pollOpened(ctx: SourceContext, config: GitlabConfig, signal: AbortSignal): Promise<number> {
-  let count = 0
-  for (const project of projectsOf(config)) {
-    for (const kind of ['issue', 'mr'] as const) {
-      if (kind === 'issue' ? !config.observeIssues : !config.observeMrs) continue
-      const cursorKey = KV.gitlab.opened(project, kind)
-      const since = ctx.state.get(cursorKey)
-      const started = new Date().toISOString()
-      if (!since) { ctx.state.set(cursorKey, cursorAt(started)); continue }
-      const path = `${kind === 'mr' ? 'merge_requests' : 'issues'}?state=opened&order_by=created_at&sort=asc&per_page=100&created_after=${encodeURIComponent(since)}`
-      const opened = await ctx.commands.withSignal(signal).glabPagesOn(project, IssueOpenedSchema, path)
-      for (const item of opened) {
+/**
+ * Stream intake, one per project and list ('issues' | 'merge_requests'): every item updated since the stream cursor is
+ * read, oldest first. A newly created item becomes an opened Trigger when its observe switch is on or it mentions the
+ * agent; every updated item's new notes are read (all of them on a watched thread or with observeNotes, only @mentions
+ * otherwise); MRs are reconciled for ticket binding and lifecycle. The first round starts the cursor and replays
+ * nothing — except that it binds the currently open MRs, which is observation, not intake.
+ */
+export async function pollStream(ctx: SourceContext, config: GitlabConfig, signal: AbortSignal, project: string, stream: 'issues' | 'merge_requests'): Promise<{ opened: number; notes: number; mrs: number }> {
+  const kind = stream === 'merge_requests' ? 'mr' as const : 'issue' as const
+  const cursorKey = KV.gitlab.stream(project, stream)
+  const cursor = ctx.state.get(cursorKey)
+  const started = new Date().toISOString()
+  if (!cursor) {
+    ctx.state.set(cursorKey, cursorAt(started))
+    if (kind === 'mr') {
+      const open = await ctx.commands.withSignal(signal).glabPagesOn(project, z.looseObject({ iid: z.number().int() }), 'merge_requests?state=opened&per_page=100')
+      for (const item of open) {
         if (signal.aborted) throw new Error('The GitLab Source stopped during the poll')
-        const trigger = openedTrigger(project, kind, item, ctx.deployment.gitlab)
-        if (!trigger) continue
-        await ctx.receive(trigger)
-        count++
-        ctx.threads.describe(`${SOURCE}:${refId(project, kind, item.iid)}`, { url: trigger.url, ...(item.title ? { label: item.title } : {}), facts: { project: { label: { zh: '项目', en: 'Project' }, value: project } } })
+        await observeMr(ctx, project, await readMr(ctx, project, item.iid, signal))
       }
-      ctx.state.set(cursorKey, cursorAt(started))
+      return { opened: 0, notes: 0, mrs: open.length }
     }
+    return { opened: 0, notes: 0, mrs: 0 }
   }
-  return count
+  const path = `${stream}?updated_after=${encodeURIComponent(cursor)}&order_by=updated_at&sort=asc&per_page=100&state=all`
+  const items = await ctx.commands.withSignal(signal).glabPagesOn(project, IssueOpenedSchema, path)
+  let opened = 0, notes = 0, mrs = 0
+  for (const item of items) {
+    if (signal.aborted) throw new Error('The GitLab Source stopped during the poll')
+    const ref = { project, kind, iid: item.iid }
+    const threadKey = `${SOURCE}:${refId(project, kind, item.iid)}`
+    if (kind === 'mr') { await observeMr(ctx, project, await readMr(ctx, project, item.iid, signal)); mrs++ }
+    if (Date.parse(item.created_at) >= Date.parse(cursor)) {
+      const trigger = openedTrigger(project, kind, item, ctx.deployment.gitlab)
+      if (trigger && (trigger.addressed === 'mention' || (kind === 'issue' ? config.observeIssues : config.observeMrs))) {
+        await ctx.receive(trigger)
+        opened++
+        ctx.threads.describe(threadKey, { url: trigger.url, ...(item.title ? { label: item.title } : {}), facts: { project: { label: { zh: '项目', en: 'Project' }, value: project } } })
+      }
+    }
+    const watched = !!ctx.threads.get(threadKey)?.subscriptions.length
+    // 从未读过的线程从流游标读起：撞动它的那条评论（往往就是 @ 机器人那条）不能丢，也不回放远古历史
+    notes += await streamNotes(ctx, ref, threadKey, signal, watched || config.observeNotes, ctx.state.get(KV.gitlab.notes(threadKey)) ?? cursor)
+  }
+  ctx.state.set(cursorKey, cursorAt(started))
+  return { opened, notes, mrs }
 }
 
-/** Observes the MRs of each configured project for ticket binding and lifecycle: the first round binds the open
- * ones (observation is not intake, so nothing is replayed as a Trigger), later rounds reconcile what changed. */
-async function pollMrs(ctx: SourceContext, config: GitlabConfig, signal: AbortSignal): Promise<number> {
+/** Reads one item's notes written after `since`: every note with `all`, only @mentions of the agent otherwise. */
+async function streamNotes(ctx: SourceContext, ref: { project: string; kind: 'issue' | 'mr'; iid: number }, threadKey: string, signal: AbortSignal, all: boolean, since: string): Promise<number> {
+  const started = new Date().toISOString()
+  const path = `${ref.kind === 'mr' ? 'merge_requests' : 'issues'}/${ref.iid}/notes?sort=asc&order_by=updated_at&per_page=100&updated_after=${encodeURIComponent(since)}`
+  const notes = await ctx.commands.withSignal(signal).glabPagesOn(ref.project, NoteSchema, path)
   let count = 0
-  for (const project of projectsOf(config)) {
+  for (const note of notes) {
     if (signal.aborted) throw new Error('The GitLab Source stopped during the poll')
-    const cursor = ctx.state.get(KV.gitlab.mrsUpdated(project))
-    const started = new Date().toISOString()
-    const path = cursor
-      ? `merge_requests?updated_after=${encodeURIComponent(cursor)}&order_by=updated_at&sort=asc&per_page=100&state=all`
-      : 'merge_requests?state=opened&per_page=100'
-    const items = await ctx.commands.withSignal(signal).glabPagesOn(project, z.looseObject({ iid: z.number().int() }), path)
-    for (const item of items) {
-      if (signal.aborted) throw new Error('The GitLab Source stopped during the poll')
-      await observeMr(ctx, project, await readMr(ctx, project, item.iid, signal))
-      count++
-    }
-    ctx.state.set(KV.gitlab.mrsUpdated(project), cursorAt(started))
+    const trigger = noteTrigger(note, ref, ctx.deployment.gitlab)
+    if (!trigger || (!all && trigger.addressed !== 'mention')) continue
+    await ctx.receive(trigger)
+    count++
   }
+  ctx.state.set(KV.gitlab.notes(threadKey), cursorAt(started))
   return count
 }
 
@@ -277,13 +294,14 @@ async function watch(ctx: SourceContext, signal: AbortSignal, doorbell: Doorbell
     if (!config || !projectsOf(config).length) ctx.report(SOURCE, health('paused', 'sourceOff'))
     else {
       try {
-        const { count: todos, threads: todoWatches } = await pollTodos(ctx, config, signal)
-        let notes = 0
-        await pollEach(ctx, SOURCE, () => signal.aborted, async thread => { notes += await pollNotes(ctx, thread, signal) })
-        const subscribed = new Set(ctx.threads.subscribed(SOURCE).map(thread => thread.key))
-        for (const thread of todoWatches) { if (!subscribed.has(thread.key)) notes += await pollNotes(ctx, thread, signal) }
-        const opened = await pollOpened(ctx, config, signal)
-        const mrs = await pollMrs(ctx, config, signal)
+        const { count: todos } = await pollTodos(ctx, config, signal)
+        let notes = 0, opened = 0, mrs = 0
+        for (const project of projectsOf(config)) {
+          for (const stream of ['issues', 'merge_requests'] as const) {
+            const round = await pollStream(ctx, config, signal, project, stream)
+            notes += round.notes; opened += round.opened; mrs += round.mrs
+          }
+        }
         failures = 0
         ctx.report(SOURCE, { state: 'ready', detail: `${todos} todos, ${notes} notes, ${opened} opened, ${mrs} mrs`, at: new Date().toISOString() })
       } catch (error) {

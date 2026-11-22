@@ -11,7 +11,7 @@ import { Store } from '../src/app/store.ts'
 import { SettingsSchema, settingsPolicy } from '../src/policy.ts'
 import { sourceContextOf, type SourceContextDeps } from '../src/app/source-context.ts'
 import { testDeployment } from './fixtures/deployment.ts'
-import { gitlabKind, pollNotes, pollTodos } from '../src/sources/gitlab.ts'
+import { gitlabKind, pollNotes, pollStream, pollTodos } from '../src/sources/gitlab.ts'
 import { noteTrigger, openedTrigger, todoTrigger, gitlabChannel, parseRefId, type GitlabNote, type GitlabTodo } from '../src/sources/gitlab-trigger.ts'
 import { sendGitlab } from '../src/sources/gitlab-channel.ts'
 import { gitlabThreadContext } from '../src/sources/gitlab-read.ts'
@@ -119,6 +119,57 @@ describe('pollTodos', () => {
     expect(h.engine.candidate(key('gitlab', 'todo-11'))?.strength).toBe('explicit')
     glab.mockImplementation(async () => [todo(14, { action_name: 'assigned' })])
     expect((await pollTodos(h.ctx, configOf(), new AbortController().signal)).count).toBe(0)
+    h.store.close()
+  })
+})
+
+describe('pollStream 流式摄入', () => {
+  const item = (iid: number, overrides: Record<string, unknown> = {}) => ({
+    iid, title: `条目 ${iid}`, description: '', created_at: '2026-11-22T08:00:00Z', updated_at: '2026-11-22T08:00:00Z',
+    author: { username: 'alice' }, web_url: `https://gitlab.example.com/devops/sandbox/-/issues/${iid}`, ...overrides,
+  })
+  const streamHost = () => {
+    const h = host()
+    vi.spyOn(h.commands, 'withSignal').mockReturnValue(h.commands)
+    const run = vi.spyOn(h.commands, 'run')
+    const setRoutes = (responses: Record<string, string>) => run.mockImplementation(async (_cli: string, args: string[]) => {
+      const path = String(args[1] ?? '')
+      for (const [match, value] of Object.entries(responses)) if (path.includes(match)) return value
+      return ''
+    })
+    return { ...h, run, setRoutes }
+  }
+  it('首轮只初始化游标不回放；之后新开的 issue（带 @提及）成为触发器，其评论也被读到', async () => {
+    const h = streamHost()
+    const signal = new AbortController().signal
+    const cfg = configOf()
+    h.setRoutes({ 'issues?': '' })
+    expect(await pollStream(h.ctx, cfg, signal, SANDBOX, 'issues')).toEqual({ opened: 0, notes: 0, mrs: 0 })
+    h.setRoutes({
+      'issues?': JSON.stringify(item(8, { description: '@agent-bot 看看', created_at: '2026-11-22T08:30:00Z' })),
+      'issues/8/notes': JSON.stringify({ id: 60, body: '@agent-bot 补充一点', author: { username: 'alice' }, system: false, created_at: '2026-11-22T08:31:00Z' }),
+    })
+    const round = await pollStream(h.ctx, cfg, signal, SANDBOX, 'issues')
+    expect(round.opened).toBe(1)
+    expect(round.notes).toBe(1)  // 新 issue 的评论从流游标读起，@提及被听到
+    expect(h.receive.mock.calls.map(c => (c[0] as Trigger).addressed)).toEqual(['mention', 'mention'])
+    h.store.close()
+  })
+  it('未订阅线程只收 @提及，订阅线程全收', async () => {
+    const h = streamHost()
+    const signal = new AbortController().signal
+    const cfg = configOf()
+    h.setRoutes({ 'issues?': '' })
+    await pollStream(h.ctx, cfg, signal, SANDBOX, 'issues')  // 初始化
+    const notes = [
+      { id: 70, body: '随便聊聊', author: { username: 'bob' }, system: false, created_at: '2026-11-22T09:00:00Z' },
+      { id: 71, body: '@agent-bot 这个呢', author: { username: 'bob' }, system: false, created_at: '2026-11-22T09:01:00Z' },
+    ]
+    h.setRoutes({ 'issues?': JSON.stringify(item(9, { created_at: '2026-11-22T07:00:00Z' })), 'issues/9/notes': notes.map(n => JSON.stringify(n)).join('\n') })
+    const round = await pollStream(h.ctx, cfg, signal, SANDBOX, 'issues')
+    expect(round.opened).toBe(0)  // created_at 在游标前，不是新开
+    expect(round.notes).toBe(1)   // 只有 @提及那条
+    expect((h.receive.mock.calls[0]![0] as Trigger).meta.noteId).toBe(71)
     h.store.close()
   })
 })

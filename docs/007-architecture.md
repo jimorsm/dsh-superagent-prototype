@@ -363,7 +363,7 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/sources/host.ts` | `SourceHost`, `SourceContext`, `Health`, `health` and the fixed health texts |
 | `src/sources/poll.ts` | What GitHub and Feishu polling share: `POLL_HORIZON_MS`, `polled`, `cursorAt`, and `pollThreads`, which keeps a failure on its Thread as `pollError` |
 | `src/sources/github.ts` | The GitHub kind and plugin entry, exported as `./github-watch`: a poll round of notifications, the pull requests of open Tickets with their CI, and subscribed Threads |
-| `src/sources/gitlab.ts` | The GitLab kind and plugin entry, exported as `./gitlab-watch`: todo and opened-issue/MR polls, subscribed Threads, and the webhook doorbell that only wakes a poll |
+| `src/sources/gitlab.ts` | The GitLab kind and plugin entry, exported as `./gitlab-watch`: todo intake, per-project issue/MR stream intake (updated items with their notes, mentions filtered unless watched), MR lifecycle observation, and the webhook doorbell that only wakes a poll |
 | `src/sources/gitlab-trigger.ts` | GitLab todos, notes, and opened issues or merge requests as Triggers, and GitLab addresses |
 | `src/sources/gitlab-channel.ts` | The GitLab Channel: notes on issues and merge requests with an idempotency marker, `sent` or `gone` |
 | `src/sources/gitlab-mr.ts` | The GitLab merge request lifecycle: `claimMr`/`observeMr` bind an MR to its ticket and end the ticket when it merges or closes, with terminal cross-channel notices |
