@@ -70,3 +70,9 @@
 未移植与理由：tonbiattack 自动合并（违背人审纪律，按规格裁剪重写）；flowioo 两项（模型键随 DSH 升级、Router 委派属面板配置）。
 
 终态：三 remote 同一 hash 7b01289；全套件 1224/1226（2 失败为上游存量，基线 4a24ee8 对照证实）；MR !1/!2/!3 等人审合并。
+
+## flowioo 复核（第 99 轮取证）
+
+- 模型键改名：宿主 DSH 实测为 **0.2.2-rc.5**，其 dsh-tool-subagent schema **仍只认 modelSelection/modelDiscovery**（grep modelSelectionSettings = 0）。flowioo 的改名针对更晚版本，现在照抄会让配置失效。判定维持：随 DSH 升级时再切。
+- Router 可委派：当前 Router 预设（cordis.patch.yml）已含 tool-subagent（provider: spawn, agentPreset: standard），委派能力**已经在位**——flowioo 的第二刀在我们部署里是既有事实。
+- 结论：flowioo 无需代码移植，两项分别为「升级时处理」与「已生效」。
