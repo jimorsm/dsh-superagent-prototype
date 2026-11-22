@@ -174,6 +174,69 @@ describe('pollStream 流式摄入', () => {
   })
 })
 
+describe('autopilot 标签派单', () => {
+  const labeledItem = (iid: number, labels: string[]) => ({
+    iid, title: `需求 ${iid}`, description: '把 README 改一下', created_at: '2026-11-22T08:00:00Z', updated_at: '2026-11-22T08:00:00Z',
+    author: { username: 'alice' }, web_url: `https://gitlab.example.com/devops/sandbox/-/issues/${iid}`, labels,
+  })
+  const autoHost = () => {
+    const h = host()
+    vi.spyOn(h.commands, 'withSignal').mockReturnValue(h.commands)
+    const run = vi.spyOn(h.commands, 'run')
+    const setRoutes = (responses: Record<string, string>) => run.mockImplementation(async (_cli: string, args: string[]) => {
+      const path = String(args[1] ?? '')
+      for (const [match, value] of Object.entries(responses)) if (path.includes(match)) return value
+      return ''
+    })
+    return { ...h, run, setRoutes }
+  }
+  const cfgWithLabel = () => gitlabKind.schema.parse({ host: GITLAB.host, projects: [{ project: SANDBOX }], cli: GITLAB.cli, autopilotLabel: 'autopilot' })
+
+  it('贴了标签的 issue 派单：贴标签的人是发起者，一次性不重复', async () => {
+    const h = autoHost()
+    const signal = new AbortController().signal
+    const cfg = cfgWithLabel()
+    h.setRoutes({ '/issues?': '' })
+    await pollStream(h.ctx, cfg, signal, SANDBOX, 'issues')  // 初始化游标
+    h.setRoutes({
+      '/issues?': JSON.stringify(labeledItem(8, ['autopilot'])),
+      '/issues/8/resource_label_events': JSON.stringify({ action: 'add', created_at: '2026-11-22T08:05:00Z', label: { name: 'autopilot' }, user: { username: 'bob' } }),
+      '/issues/8/notes': '',
+    })
+    const round = await pollStream(h.ctx, cfg, signal, SANDBOX, 'issues')
+    expect(round.opened).toBe(1)
+    const trigger = h.receive.mock.calls.at(-1)![0] as Trigger
+    expect(trigger.addressed).toBe('direct')
+    expect(trigger.actor).toEqual({ source: 'gitlab', id: 'bob' })  // 贴标签的人是发起者
+    expect(trigger.meta).toMatchObject({ autopilot: 'autopilot', labeledBy: 'bob', iid: 8 })
+    expect(trigger.text).toContain('标签派单')
+    // 下一轮同 id 已存在，不再读 label events 也不重复派单
+    const callsBefore = h.run.mock.calls.length
+    const again = await pollStream(h.ctx, cfg, signal, SANDBOX, 'issues')
+    expect(again.opened).toBe(0)
+    expect(h.run.mock.calls.length).toBeLessThanOrEqual(callsBefore + 2)  // 只读列表+notes，不碰 label events
+    h.store.close()
+  })
+  it('没有标签、标签名为空、或查不到贴标签的人，都不派单', async () => {
+    const h = autoHost()
+    const signal = new AbortController().signal
+    const cfg = cfgWithLabel()
+    h.setRoutes({ '/issues?': '' })
+    await pollStream(h.ctx, cfg, signal, SANDBOX, 'issues')
+    // 无标签
+    h.setRoutes({ '/issues?': JSON.stringify(labeledItem(8, ['other'])), '/issues/8/notes': '' })
+    expect((await pollStream(h.ctx, cfg, signal, SANDBOX, 'issues')).opened).toBe(0)
+    // 有标签但查不到谁贴的 → fail closed
+    h.setRoutes({ '/issues?': JSON.stringify(labeledItem(9, ['autopilot'])), '/issues/9/resource_label_events': '', '/issues/9/notes': '' })
+    expect((await pollStream(h.ctx, cfg, signal, SANDBOX, 'issues')).opened).toBe(0)
+    // 标签名留空 = 功能关闭
+    const off = configOf()
+    h.setRoutes({ '/issues?': JSON.stringify(labeledItem(10, ['autopilot'])), '/issues/10/notes': '' })
+    expect((await pollStream(h.ctx, off, signal, SANDBOX, 'issues')).opened).toBe(0)
+    h.store.close()
+  })
+})
+
 describe('todo-watched notes', () => {
   it('hears a re-mention on a thread whose pending todo was already consumed', async () => {
     const h = host()

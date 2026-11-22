@@ -6,9 +6,10 @@ import { z } from 'zod'
 import { GitlabAccountSchema } from '../deployment.ts'
 import { KV } from '../kv.ts'
 import { health, sourceContext, type SourceContext } from './host.ts'
+import { key } from '../core/index.ts'
 import { cursorAt, pause } from './poll.ts'
 import type { Localized, SourceKind } from './kind.ts'
-import { NoteSchema, openedTrigger, noteTrigger, todoTrigger, TodoSchema, parseRefId, refId, SOURCE } from './gitlab-trigger.ts'
+import { NoteSchema, openedTrigger, noteTrigger, todoTrigger, TodoSchema, parseRefId, refId, SOURCE, autopilotTrigger } from './gitlab-trigger.ts'
 import { gitlabLink, sendGitlab } from './gitlab-channel.ts'
 import { observeMr, readMr } from './gitlab-mr.ts'
 import { gitlabThreadContext } from './gitlab-read.ts'
@@ -18,6 +19,8 @@ export const GitlabConfigSchema = GitlabAccountSchema.extend({
   pollSeconds: z.number().int().min(30).max(3600).default(60),
   failuresBeforeError: z.number().int().min(1).max(20).default(3),
   webhookToken: z.string().trim().default(''),
+  /** Issues carrying this label are dispatched automatically (the labeler is the authority). Empty disables it. */
+  autopilotLabel: z.string().trim().default(''),
   observeIssues: z.boolean().default(false),
   observeMrs: z.boolean().default(false),
   observeNotes: z.boolean().default(false),
@@ -30,7 +33,18 @@ const ProjectSchema = z.looseObject({ id: z.number().int(), path_with_namespace:
 const IssueOpenedSchema = z.looseObject({
   iid: z.number().int(), title: z.string().nullish(), description: z.string().nullish(), created_at: z.string(),
   author: z.looseObject({ username: z.string() }).nullish(), web_url: z.string().nullish(),
+  labels: z.array(z.string()).nullish(),
 })
+const LabelEventSchema = z.looseObject({ action: z.string(), created_at: z.string(),
+  label: z.looseObject({ name: z.string() }).nullish(), user: z.looseObject({ username: z.string() }).nullish() })
+
+/** Who applied the autopilot label to an issue, and when; undefined fails closed (no dispatch). */
+async function labelerOf(ctx: SourceContext, project: string, iid: number, label: string, signal: AbortSignal): Promise<{ login: string; at: string } | undefined> {
+  const events = await ctx.commands.withSignal(signal).glabPagesOn(project, LabelEventSchema, `issues/${iid}/resource_label_events?per_page=100`)
+  const added = events.filter(event => event.action === 'add' && event.label?.name === label && event.user?.username)
+  const latest = added.at(-1)
+  return latest ? { login: latest.user!.username!, at: latest.created_at } : undefined
+}
 
 const WEBHOOK_PATH = '/superagent/gitlab-webhook'
 /** Hashes compared so the webhook token check never leaks its length through timing. */
@@ -81,6 +95,8 @@ export const gitlabKind: SourceKind<GitlabConfig> = {
       hint: { zh: '非空时接受 POST ' + WEBHOOK_PATH + '（X-Gitlab-Token 头相同）：webhook 只当门铃，数据仍从 API 拉取。留空则不注册该路由。', en: 'When set, accepts POST ' + WEBHOOK_PATH + ' with the same X-Gitlab-Token header as a doorbell; data is still pulled through the API. Empty disables the route.' } },
     { key: 'pollSeconds', type: 'number', advanced: true, min: 30, max: 3600, label: { zh: '轮询间隔 / 秒', en: 'Polling interval / seconds' } },
     { key: 'failuresBeforeError', type: 'number', advanced: true, min: 1, max: 20, label: { zh: '连续失败几次后报告异常', en: 'Failed polls before reporting an error' } },
+    { key: 'autopilotLabel', type: 'text', advanced: true, label: { zh: '自动接单标签', en: 'Autopilot label' },
+      hint: { zh: '贴了这个标签的 issue 自动派单实现并开 MR（不自动合并）；贴标签的人是发起者，需在可发起工作的账号名单里。留空关闭。', en: 'Issues carrying this label are dispatched automatically and end in an MR (never auto-merged); the labeler is the originator and must be on the allowed accounts list. Empty disables it.' } },
     { key: 'observeIssues', type: 'switch', label: { zh: '接收这些项目里的新 issue', en: 'Receive new issues in the projects' } },
     { key: 'observeMrs', type: 'switch', label: { zh: '接收这些项目里的新 MR', en: 'Receive new merge requests in the projects' } },
     { key: 'observeNotes', type: 'switch', label: { zh: '接收这些项目里的评论', en: 'Receive notes in the projects' } },
@@ -259,6 +275,12 @@ export async function pollStream(ctx: SourceContext, config: GitlabConfig, signa
         opened++
         ctx.threads.describe(threadKey, { url: trigger.url, ...(item.title ? { label: item.title } : {}), facts: { project: { label: { zh: '项目', en: 'Project' }, value: project } } })
       }
+    }
+    if (kind === 'issue' && config.autopilotLabel && item.labels?.includes(config.autopilotLabel)
+      && !ctx.triggers.get(key(SOURCE, `autopilot-${project}-${item.iid}`))) {
+      const labeled = await labelerOf(ctx, project, item.iid, config.autopilotLabel, signal)
+      const trigger = labeled ? autopilotTrigger(project, item, labeled.login, labeled.at, config.autopilotLabel, ctx.deployment.gitlab) : undefined
+      if (trigger) { await ctx.receive(trigger); opened++ }
     }
     const watched = !!ctx.threads.get(threadKey)?.subscriptions.length
     // 从未读过的线程从流游标读起：撞动它的那条评论（往往就是 @ 机器人那条）不能丢，也不回放远古历史

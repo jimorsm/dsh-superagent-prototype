@@ -85,6 +85,28 @@ export function todoTrigger(todo: GitlabTodo, project: string, gitlab: GitlabAcc
   }
 }
 
+/** The Trigger of an issue carrying the autopilot label: the labeler is the actor and authority, and the trigger id
+ * is one-shot per issue, so a re-added label does not dispatch twice (mention the agent to re-run). */
+export function autopilotTrigger(project: string, issue: { iid: number; title?: string | null; description?: string | null; created_at: string; author?: { username: string } | null; web_url?: string | null },
+  labeledBy: string, labeledAt: string, label: string, gitlab: GitlabAccount | undefined): Trigger | undefined {
+  if (!gitlab || !labeledBy) return undefined
+  const author = issue.author?.username ?? ''
+  if (author && sameName(author, gitlab.login)) return undefined
+  const id = refId(project, 'issue', issue.iid)
+  const url = issue.web_url ?? gitlabPage(gitlab.host, project, 'issue', issue.iid)
+  return {
+    id: key(SOURCE, `autopilot-${project}-${issue.iid}`), source: SOURCE,
+    threads: [{ source: SOURCE, id }],
+    actor: { source: SOURCE, id: labeledBy },
+    human: true, addressed: 'direct',
+    at: labeledAt,
+    text: `[${label} 标签派单，由 @${labeledBy} 标记]\n\n${[issue.title, issue.description].filter(Boolean).join('\n\n')}`,
+    channel: gitlabChannel(project, 'issue', issue.iid, url),
+    url,
+    meta: { project, kind: 'issue', iid: issue.iid, autopilot: label, labeledBy },
+  }
+}
+
 /** The Trigger of an opened issue or merge request (observe switches), keyed by its creation so it is stable. */
 export function openedTrigger(project: string, kind: 'issue' | 'mr', opened: { iid: number; title?: string | null; description?: string | null; created_at: string; author?: { username: string } | null; web_url?: string | null }, gitlab: GitlabAccount | undefined): Trigger | undefined {
   if (!gitlab) return undefined
