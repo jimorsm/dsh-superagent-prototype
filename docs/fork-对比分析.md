@@ -56,3 +56,17 @@
 4. CI 摘要进线程事实（跟随 3 顺手带）
 5. weixin 源插件（独立目录，不影响现有）
 6. worker 池自适应（小补丁）
+
+## 移植收官实测（2026-11-22）
+
+| 移植项 | 提交 | 真机验证 |
+|---|---|---|
+| M5 MR 生命周期绑定 | ca35a21 | MR !1/!2 自动绑到工单 56ec5fee/e515d83c |
+| 流式摄入 pollStream | b1d3cc0 | 真机收包驱动，取代 pollOpened/pollEach |
+| ndjson 分页 | 同上 | 32/32 规格绿，线上正常分页 |
+| weixin 源 + workerCapacity | 50e7b0e | 插件注册默认禁用；worker 池按核数定容 |
+| 裁剪版 autopilot | 7b01289 | issue #3 贴标签 → 工单 8ab40895 → MR !3 → stage=person，约 4 分钟，无自动合并 |
+
+未移植与理由：tonbiattack 自动合并（违背人审纪律，按规格裁剪重写）；flowioo 两项（模型键随 DSH 升级、Router 委派属面板配置）。
+
+终态：三 remote 同一 hash 7b01289；全套件 1224/1226（2 失败为上游存量，基线 4a24ee8 对照证实）；MR !1/!2/!3 等人审合并。
